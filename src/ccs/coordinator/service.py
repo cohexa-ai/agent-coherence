@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
 import secrets
@@ -13,11 +14,26 @@ import threading
 import time
 import warnings
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Callable, Iterable, Literal, Mapping, Optional, Sequence
+from typing import Callable, Iterable, Iterator, Literal, Mapping, Optional, Sequence
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from ccs.coordinator.retention import collectible_versions
+from ccs.core.basis import (
+    ANSWER_HOLD,
+    ANSWER_PROCEED,
+    RECOVERY_REDERIVE,
+    BasisCheckAnswer,
+    BasisCommitAnswer,
+    BasisMember,
+    CheckedMember,
+    CommittedTarget,
+    MovedMember,
+    ResolvedRow,
+    TargetRefusal,
+    classify_member,
+)
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_ABSENT_REASON,
     CALLER_PRINCIPAL_CLAIMED_REASON,
@@ -33,6 +49,7 @@ from ccs.core.exceptions import (
     HANDOFF_NOT_SUCCESSOR_REASON,
     NOT_RETAINED_REASON,
     OCC_CALLER_TRANSIENT_REASON,
+    OCC_IS_SHARED_OR_INVALID_ONLY_REASON,
     PIN_STATES,
     RESTORE_MEMBER_OUTCOMES,
     RESTORE_STATUSES,
@@ -55,6 +72,7 @@ from ccs.core.exceptions import (
     GiverFenced,
     OccCallerTransientError,
     OtherHolder,
+    RegistryLockTimeout,
     SessionInvalidated,
     StaleReadGeneration,
 )
@@ -94,6 +112,8 @@ from ccs.core.types import (
 from .fold_merge import FOLD_MERGE_PREEMPTER_ID, FOLD_MERGE_TRIGGER, index_key_of
 from .registry_protocol import (
     RELEASE_TRIGGER,
+    BasisMoved,
+    BasisRow,
     CheckpointMember,
     CheckpointRecord,
     RegistryBase,
@@ -101,6 +121,7 @@ from .registry_protocol import (
     TransferRecord,
     TransferRequest,
 )
+from .sqlite_registry import row_registration
 
 # The write-claim states, as one membership set (mirrors the registries' _M_OR_E_STATES).
 _M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
@@ -394,6 +415,81 @@ class ReleaseRequest:
     agent_id: UUID
     artifact_id: UUID
     issued_at_tick: int
+
+
+#: The most members one basis may name. A basis is read and compared while the
+#: service and registry locks are held, so its size bounds how long every other
+#: caller waits; it stays far under what one registry statement may bind.
+BASIS_MAX_MEMBERS = 64
+
+#: A lookup-only resolver for the basis check and commit, run once per member
+#: (and once for a commit's target) inside their hold: the id of the row the
+#: member's path reaches, or ``None``, and whether the path is tracked. See
+#: :meth:`CoordinatorService.check_basis`.
+BasisResolve = Callable[[BasisMember], tuple[UUID | None, bool]]
+
+
+@dataclass(frozen=True)
+class BasisMemberRead:
+    """What :meth:`CoordinatorService.basis_member` read at one instant.
+
+    ``member`` is what a caller records. ``content_hash`` is the row's recorded
+    hash. ``content`` is the stored body only when the row records no hash or
+    the body's hash is the recorded one, else ``None``: a hash-only commit
+    leaves the in-memory registry's previous body in place, and SQLite stores
+    no body. A caller acts only on these bytes, or on bytes whose hash matches.
+    """
+
+    member: BasisMember
+    content_hash: str | None
+    content: str | bytes | None
+
+
+@dataclass(frozen=True)
+class BasisCommitResult:
+    """A commit under a basis: the answer and, on a win, the target as the
+    commit left it with the invalidation signals the caller publishes."""
+
+    answer: BasisCommitAnswer
+    artifact: Artifact | None = None
+    signals: tuple[InvalidationSignal, ...] = ()
+
+
+@dataclass(frozen=True)
+class _ResolvedMember:
+    """One compared member as the hold found it: the row (or none) and the
+    hold reason (``None`` when unchanged)."""
+
+    member: BasisMember
+    artifact_id: UUID | None
+    row: ResolvedRow | None
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class _BasisWrite:
+    """The write a commit under a basis lands on its target when it holds."""
+
+    target: BasisMember
+    agent_id: UUID
+    caller: UUID | None
+    content: bytes | str | None
+    content_hash: str
+    size_tokens: int | None
+    issued_at_tick: int
+
+
+@dataclass(frozen=True)
+class _CasAdmission:
+    """What a compare-and-swap's preconditions admitted, read inside its hold:
+    the target before the write, the committer and its session-level identity,
+    the handoff record live at admission, and the holders a win invalidates."""
+
+    before: Artifact
+    agent_id: UUID
+    identity: UUID
+    admitted: TransferRecord | None
+    victim_states: dict[UUID, MESIState]
 
 
 class CallerPrincipalUncached(Exception):
@@ -1891,6 +1987,239 @@ class CoordinatorService:
             )
 
     # ------------------------------------------------------------------
+    # Basis check and commit: is every input still what the caller read?
+    # ------------------------------------------------------------------
+
+    def basis_member(self, artifact_id: UUID) -> BasisMemberRead:
+        """Record ``artifact_id`` as a basis member: its name, version and
+        registration, with the row's content hash and the body that hash
+        describes, when the registry holds it.
+
+        Read in one registry hold, so the version, hash and bytes describe one
+        instant, and nothing is granted: :meth:`fetch` grants a lone reader
+        EXCLUSIVE, which would then refuse the caller's own commit under the
+        basis. Raises ``CoherenceError`` for an unknown id."""
+        with self.registry.abort_guard():
+            artifact = self._require_artifact(artifact_id)
+            (row,) = [
+                found
+                for found in self.registry.basis_rows((), (artifact.name,))
+                if found.artifact_id == artifact_id
+            ]
+            # SQLite stores no body (its get_content answers b"" for any row).
+            stored = None if isinstance(self.registry, SqliteExtended) else (
+                self.registry.get_content(artifact_id)
+            )
+        described = stored is not None and (
+            artifact.content_hash is None or _body_hash(stored) == artifact.content_hash
+        )
+        member = BasisMember(artifact.name, artifact.version, row.registration)
+        return BasisMemberRead(member, artifact.content_hash, stored if described else None)
+
+    def check_basis(
+        self,
+        basis: Iterable[BasisMember],
+        *,
+        resolve: BasisResolve | None = None,
+        deadline: float | None = None,
+    ) -> BasisCheckAnswer:
+        """Whether every member of ``basis`` is still the version (and the
+        registration) the caller read, at one instant.
+
+        ``proceed`` carries every member's expected and current version;
+        ``hold`` carries every moved member in request order, one reason each,
+        and ``rederive``. The members are resolved and their rows read in one
+        registry statement under one hold of the service session lock and then
+        the registry lock, the order :meth:`begin_session` takes them. Read-only
+        and lookup-only: nothing is registered, granted or captured, and no
+        grant is consulted.
+
+        In process (no ``resolve``) every member carries the registration it
+        was read under (:meth:`basis_member` supplies it) and is found by it;
+        its path is the record's name, used only to tell a replaced member
+        (another record carries the name, or the record read carries another)
+        from a vanished one.
+
+        ``resolve(member) -> (artifact_id | None, is_tracked)`` is the
+        coordinator's request door. It runs inside the hold, once per member in
+        request order (and once for a commit's target), and finds the row the
+        member's path reaches by lookup only (never registering one), with
+        whether the path is tracked. Build it from ``find_requested`` and
+        ``is_tracked_request`` with each member's request name computed before
+        the call. The rows are then read through their registration, which on
+        the durable registry the door reads is the row id. Members it resolves
+        may omit the registration and are then compared by version only.
+
+        ``deadline`` is a :func:`time.monotonic` instant bounding the wait for
+        each lock: past it :class:`RegistryLockTimeout` is raised, naming the
+        lock that timed out, and nothing was read.
+
+        Raises ``ValueError`` for an empty basis, more than
+        :data:`BASIS_MAX_MEMBERS` members, a path or registration named twice,
+        or (in process) a member without its registration."""
+        members = _validated_basis(basis, registration_required=resolve is None)
+        with self._basis_hold(abort=None, deadline=deadline):
+            resolved = self._resolve_basis(members, resolve)
+        moved = _moved_members(resolved)
+        if moved:
+            return BasisCheckAnswer(answer=ANSWER_HOLD, moved=moved, recovery=RECOVERY_REDERIVE)
+        checked = tuple(
+            CheckedMember(r.member.path, r.member.version, r.row.version)
+            for r in resolved
+            if r.row is not None
+        )
+        return BasisCheckAnswer(answer=ANSWER_PROCEED, checked=checked)
+
+    def commit_if_basis(
+        self,
+        basis: Iterable[BasisMember],
+        target: BasisMember,
+        expected_target_version: int,
+        content: bytes | str | None = None,
+        *,
+        agent_id: UUID,
+        caller: UUID | None = None,
+        content_hash: str | None = None,
+        size_tokens: int | None = None,
+        issued_at_tick: int = 0,
+        resolve: BasisResolve | None = None,
+        abort: threading.Event | None = None,
+        deadline: float | None = None,
+    ) -> BasisCommitResult:
+        """Compare-and-swap ``target`` only while every member of ``basis``
+        is still what the caller read.
+
+        One hold of the service session lock and the registry lock covers it
+        all, in this order: classify the members and the target (exactly as
+        :meth:`check_basis`, whose ``resolve`` and ``deadline`` this takes);
+        run the compare-and-swap preconditions; then
+        ``registry.commit_cas_if_basis``, which compares the basis again inside
+        the target's own transaction and writes only the target.
+
+        ``target`` is described like a member, at ``expected_target_version``
+        (its ``version`` must be that), whether or not it is one of the
+        members; one that names a member must be that member exactly. The
+        committer is ``agent_id``, with ``caller`` its session-level identity
+        as :meth:`commit_cas` takes it. ``content`` or ``content_hash`` is
+        required; a missing hash is computed from the content.
+
+        The answer keeps basis moves and target refusals apart:
+
+        - a moved member or target: ``hold`` with every one and ``rederive``,
+          nothing written. A classification hold is decided before any
+          precondition runs;
+        - the basis held but the target's compare-and-swap was refused: ``hold``
+          with an empty ``moved`` and the refusal as ``target``. The existing
+          preconditions still raise: :class:`OccCallerTransientError`, the
+          ``CoherenceError`` for a caller holding the target EXCLUSIVE or
+          MODIFIED, and :class:`GiverFenced`;
+        - a win: ``proceed`` with ``committed``, plus the updated artifact and
+          its invalidation signals, with the handoff labelled as a commit does.
+
+        ``abort`` is the handler watchdog's: set before the registry lock is
+        won, nothing runs (``WatchdogAbandoned``)."""
+        registration_required = resolve is None
+        members = _validated_basis(basis, registration_required=registration_required)
+        compared = _with_target(
+            members, target, expected_target_version, registration_required=registration_required
+        )
+        write = _BasisWrite(
+            target=target,
+            agent_id=agent_id,
+            caller=caller,
+            content=content,
+            content_hash=_commit_hash(content, content_hash),
+            size_tokens=size_tokens,
+            issued_at_tick=issued_at_tick,
+        )
+        with self._basis_hold(abort=abort, deadline=deadline):
+            resolved = self._resolve_basis(compared, resolve)
+            moved = _moved_members(resolved)
+            if moved:
+                return BasisCommitResult(_rederive(moved))
+            return self._commit_on_held_basis(resolved, write)
+
+    def _commit_on_held_basis(
+        self, resolved: tuple[_ResolvedMember, ...], write: _BasisWrite
+    ) -> BasisCommitResult:
+        """The commit half of :meth:`commit_if_basis`, once every compared
+        member resolved unchanged. Caller holds the basis hold."""
+        (target,) = [r for r in resolved if r.member == write.target]
+        target_id = target.artifact_id
+        assert target_id is not None  # an unresolved target is a classification hold
+        admission = self._admit_cas(target_id, write.agent_id, write.caller)
+        result = self.registry.commit_cas_if_basis(
+            {r.artifact_id: r.member.version for r in resolved if r.artifact_id is not None},
+            target_id,
+            write.agent_id,
+            expected_version=write.target.version,
+            content_hash=write.content_hash,
+            size_tokens=write.size_tokens,
+            content=write.content,
+            tick=write.issued_at_tick,
+        )
+        if isinstance(result, BasisMoved):
+            return BasisCommitResult(_rederive(_moved_in_transaction(resolved, result.moved)))
+        if isinstance(result, CasCorruption):
+            raise _cas_corruption(write.agent_id, target_id, write.target.version, result)
+        if isinstance(result, ConflictDetail):
+            refusal = _target_refusal(write.target.path, result)
+            return BasisCommitResult(BasisCommitAnswer(answer=ANSWER_HOLD, target=refusal))
+        updated, signals = self._settle_cas_win(admission, result, write.issued_at_tick)
+        won = BasisCommitAnswer(
+            answer=ANSWER_PROCEED, committed=CommittedTarget(write.target.path, updated.version)
+        )
+        return BasisCommitResult(won, artifact=updated, signals=tuple(signals))
+
+    @contextmanager
+    def _basis_hold(
+        self, *, abort: threading.Event | None, deadline: float | None
+    ) -> Iterator[None]:
+        """The session lock, then the registry guard, as :meth:`begin_session`
+        and the atomic effect gate take them, each wait bounded by
+        ``deadline``. The session lock is released whatever the guard raises,
+        so a stalled registry or a set ``abort`` leaves no lock held."""
+        wait = -1 if deadline is None else max(0.0, deadline - time.monotonic())
+        if not self._session_lock.acquire(timeout=wait):
+            raise RegistryLockTimeout(
+                "another thread held the coordinator's session lock past the "
+                "caller's deadline; nothing was read or written."
+            )
+        try:
+            with self.registry.abort_guard(abort, deadline=deadline):
+                yield
+        finally:
+            self._session_lock.release()
+
+    def _resolve_basis(
+        self, members: tuple[BasisMember, ...], resolve: BasisResolve | None
+    ) -> tuple[_ResolvedMember, ...]:
+        """Find and classify every member by lookup only, reading their rows
+        in one registry statement. Caller holds the basis hold."""
+        if resolve is None:
+            rows = self.registry.basis_rows(
+                [m.registration for m in members if m.registration is not None],
+                [m.path for m in members],
+            )
+            by_registration = {row.registration: row for row in rows}
+            return tuple(
+                _by_registration(m, by_registration.get(m.registration or ""), rows)
+                for m in members
+            )
+        looked_up = [resolve(member) for member in members]
+        found_ids = {artifact_id for artifact_id, _ in looked_up if artifact_id is not None}
+        rows = self.registry.basis_rows([row_registration(i) for i in found_ids], ())
+        by_id = {row.artifact_id: row for row in rows}
+        return tuple(
+            _classified(
+                member,
+                None if artifact_id is None else by_id.get(artifact_id),
+                is_tracked=is_tracked,
+            )
+            for member, (artifact_id, is_tracked) in zip(members, looked_up)
+        )
+
+    # ------------------------------------------------------------------
     # Session pin lifetime — heartbeat lease + liveness sweep (Unit 5 / R4)
     # ------------------------------------------------------------------
 
@@ -2542,6 +2871,33 @@ class CoordinatorService:
             CoherenceError: artifact missing, caller in M/E (use ``commit``), or
                 the registry reported corruption (all non-retryable).
         """
+        admission = self._admit_cas(artifact_id, agent_id, caller)
+        result = self.registry.commit_cas(
+            artifact_id,
+            agent_id,
+            expected_version=expected_version,
+            content_hash=content_hash,
+            size_tokens=size_tokens,
+            content=content,
+            tick=issued_at_tick,
+        )
+
+        if isinstance(result, CasCorruption):
+            raise _cas_corruption(agent_id, artifact_id, expected_version, result)
+        if isinstance(result, ConflictDetail):
+            # Typed retry-eligible conflict: no mutation happened in the
+            # registry, so emit no invalidation signals and surface it as-is.
+            return result
+        return self._settle_cas_win(admission, result, issued_at_tick)
+
+    def _admit_cas(
+        self, artifact_id: UUID, agent_id: UUID, caller: UUID | None
+    ) -> _CasAdmission:
+        """The compare-and-swap preconditions the registry leaves to the
+        service (see :meth:`_commit_cas_impl`), and what a win is settled
+        against. Raises :class:`OccCallerTransientError`, ``CoherenceError``
+        or :class:`GiverFenced` as that method documents. Caller holds the
+        abort guard."""
         artifact = self._require_artifact(artifact_id)
 
         if self.registry.get_agent_transient(artifact_id, agent_id) is not None:
@@ -2554,10 +2910,10 @@ class CoordinatorService:
             )
 
         agent_state = self.registry.get_agent_state(artifact_id, agent_id)
-        if agent_state in {MESIState.EXCLUSIVE, MESIState.MODIFIED}:
+        if agent_state in _M_OR_E_STATES:
             raise CoherenceError(
                 f"commit_cas_not_allowed agent={agent_id} artifact={artifact_id} "
-                f"state={agent_state} reason=occ_is_shared_or_invalid_only "
+                f"state={agent_state} reason={OCC_IS_SHARED_OR_INVALID_ONLY_REASON} "
                 f"(use commit() for an EXCLUSIVE/MODIFIED holder)"
             )
 
@@ -2570,50 +2926,40 @@ class CoordinatorService:
         # The abort guard keeps this snapshot consistent with the result for
         # registry writes made through this process.
         victim_states = self.registry.get_state_map(artifact_id)
-        result = self.registry.commit_cas(
-            artifact_id,
-            agent_id,
-            expected_version=expected_version,
-            content_hash=content_hash,
-            size_tokens=size_tokens,
-            content=content,
-            tick=issued_at_tick,
-        )
+        return _CasAdmission(artifact, agent_id, identity, admitted, victim_states)
 
-        if isinstance(result, CasCorruption):
-            raise CoherenceError(
-                f"commit_cas_corruption agent={agent_id} artifact={artifact_id} "
-                f"expected_version={expected_version} "
-                f"current_version={result.current_version} "
-                f"(expected > current — corruption or multi-coordinator violation)"
-            )
-        if isinstance(result, ConflictDetail):
-            # Typed retry-eligible conflict: no mutation happened in the
-            # registry, so emit no invalidation signals and surface it as-is.
-            return result
-
-        updated, invalidated_ids = result
+    def _settle_cas_win(
+        self,
+        admission: _CasAdmission,
+        win: tuple[Artifact, list[UUID]],
+        issued_at_tick: int,
+    ) -> tuple[Artifact, list[InvalidationSignal]]:
+        """A compare-and-swap win's signals, single-writer check and handoff
+        label, as every compare-and-swap commit settles one. Caller holds the
+        abort guard."""
+        updated, invalidated_ids = win
+        artifact_id = admission.before.id
         # Defense-in-depth: the CAS computed N+1 atomically; assert it did not
         # regress (NOT the concurrency guard — that was the version check).
-        check_monotonic_version(artifact.version, updated.version)
+        check_monotonic_version(admission.before.version, updated.version)
         signals = [
             InvalidationSignal(
                 artifact_id=artifact_id,
                 new_version=updated.version,
                 issued_at_tick=issued_at_tick,
-                issuer_agent_id=agent_id,
+                issuer_agent_id=admission.agent_id,
                 victim_agent_id=invalidated_id,
                 # A second registry writer (only where no single-writer lock
                 # holds, #453) may add a peer after the snapshot and before the
                 # commit result is returned.  The commit has
                 # still landed; preserve that success and report the state as
                 # unknown instead of turning it into a KeyError.
-                victim_state=victim_states.get(invalidated_id),
+                victim_state=admission.victim_states.get(invalidated_id),
             )
             for invalidated_id in invalidated_ids
         ]
         self._validate_single_writer(artifact_id)
-        self._label_live_transfer(admitted, identity)
+        self._label_live_transfer(admission.admitted, admission.identity)
         return updated, signals
 
     def commit_all(
@@ -4072,3 +4418,180 @@ def _invalidation_transient_for_state(state: MESIState) -> TransientState | None
     if state == MESIState.MODIFIED:
         return TransientState.MSA
     return None
+
+
+def _cas_corruption(
+    agent_id: UUID, artifact_id: UUID, expected_version: int, result: CasCorruption
+) -> CoherenceError:
+    """The non-retryable error a compare-and-swap that saw corruption raises."""
+    return CoherenceError(
+        f"commit_cas_corruption agent={agent_id} artifact={artifact_id} "
+        f"expected_version={expected_version} "
+        f"current_version={result.current_version} "
+        f"(expected > current — corruption or multi-coordinator violation)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Basis check and commit: validation, classification and answers
+# ---------------------------------------------------------------------------
+
+
+def _validated_basis(
+    basis: Iterable[BasisMember], *, registration_required: bool
+) -> tuple[BasisMember, ...]:
+    """The basis as a tuple, or ``ValueError`` for one no answer could
+    describe: empty, past :data:`BASIS_MAX_MEMBERS`, a member without the
+    registration it is found by, or a path or registration named twice (one
+    row would then carry two comparands)."""
+    members = tuple(basis)
+    if not members:
+        raise ValueError("a basis names at least one member")
+    if len(members) > BASIS_MAX_MEMBERS:
+        raise ValueError(f"a basis names at most {BASIS_MAX_MEMBERS} members, got {len(members)}")
+    if registration_required and any(member.registration is None for member in members):
+        raise ValueError(
+            "every member needs the registration it was read under: in process "
+            "a member is found by it"
+        )
+    paths = [member.path for member in members]
+    registrations = [m.registration for m in members if m.registration is not None]
+    if len(set(paths)) != len(paths) or len(set(registrations)) != len(registrations):
+        raise ValueError("a basis names each path and each registration once")
+    return members
+
+
+def _with_target(
+    members: tuple[BasisMember, ...],
+    target: BasisMember,
+    expected_target_version: int,
+    *,
+    registration_required: bool,
+) -> tuple[BasisMember, ...]:
+    """Every member a commit compares: the basis, plus the target when it is
+    not one of the members. A target compares at ``expected_target_version``
+    whether or not it is a member; one that names a member (its path or its
+    registration) must be that member exactly, so one row never carries two
+    comparands."""
+    if target.version != expected_target_version:
+        raise ValueError(
+            f"the target is described at version {target.version} but expected "
+            f"at version {expected_target_version}"
+        )
+    if registration_required and target.registration is None:
+        raise ValueError("the target needs the registration it was read under")
+    named = [
+        member
+        for member in members
+        if member.path == target.path
+        or (target.registration is not None and member.registration == target.registration)
+    ]
+    if not named:
+        return (*members, target)
+    if named != [target]:
+        raise ValueError(
+            "the target names a member but disagrees with its path, version or registration"
+        )
+    return members
+
+
+def _commit_hash(content: bytes | str | None, content_hash: str | None) -> str:
+    """The hash a commit records: the given one, or the content's. Neither,
+    or two that disagree, is a malformed call."""
+    if content is None:
+        if content_hash is None:
+            raise ValueError("a commit under a basis needs content or content_hash")
+        return content_hash
+    computed = _body_hash(content)
+    if content_hash is not None and content_hash != computed:
+        raise ValueError("content_hash is not the hash of content")
+    return computed
+
+
+def _body_hash(body: bytes | str) -> str:
+    """:func:`compute_content_hash` of a body, ``bytes`` included (the same
+    digest as the text those bytes encode)."""
+    if isinstance(body, str):
+        return compute_content_hash(body)
+    return hashlib.sha256(body).hexdigest()
+
+
+def _classified(
+    member: BasisMember,
+    row: BasisRow | None,
+    *,
+    is_tracked: bool,
+    name_held_by_other_record: bool = False,
+) -> _ResolvedMember:
+    resolved = None if row is None else ResolvedRow(row.version, row.registration)
+    reason = classify_member(
+        recorded_version=member.version,
+        recorded_registration=member.registration,
+        is_tracked=is_tracked,
+        row=resolved,
+        name_held_by_other_record=name_held_by_other_record,
+    )
+    return _ResolvedMember(member, None if row is None else row.artifact_id, resolved, reason)
+
+
+def _by_registration(
+    member: BasisMember, found: BasisRow | None, rows: list[BasisRow]
+) -> _ResolvedMember:
+    """Classify a member found by its registration. In process nothing is out
+    of policy, so every member is tracked."""
+    if found is not None and found.name == member.path:
+        return _classified(member, found, is_tracked=True)
+    # The path no longer names the record that was read: that record is gone,
+    # or carries another name. Another record carrying the path, or the record
+    # read carrying another name, makes it a replacement rather than a vanish.
+    replaced = found is not None or any(row.name == member.path for row in rows)
+    return _classified(member, None, is_tracked=True, name_held_by_other_record=replaced)
+
+
+def _moved_members(resolved: tuple[_ResolvedMember, ...]) -> tuple[MovedMember, ...]:
+    """Every member that moved, in request order, never only the first."""
+    return tuple(
+        MovedMember(
+            r.member.path, r.member.version, None if r.row is None else r.row.version, r.reason
+        )
+        for r in resolved
+        if r.reason is not None
+    )
+
+
+def _moved_in_transaction(
+    resolved: tuple[_ResolvedMember, ...], moved: Mapping[UUID, int | None]
+) -> tuple[MovedMember, ...]:
+    """The members a commit's own transaction found moved (a writer outside
+    the service's hold), each labelled by the classifier from the version the
+    transaction saw. The row is the one the hold resolved, so its registration
+    is unchanged; only its version moved, or it is gone."""
+    relabelled = []
+    for r in resolved:
+        if r.artifact_id not in moved or r.row is None:
+            continue
+        current = moved[r.artifact_id]
+        reason = classify_member(
+            recorded_version=r.member.version,
+            recorded_registration=r.member.registration,
+            is_tracked=True,
+            row=None if current is None else replace(r.row, version=current),
+        )
+        relabelled.append(MovedMember(r.member.path, r.member.version, current, reason))
+    return tuple(relabelled)
+
+
+def _rederive(moved: tuple[MovedMember, ...]) -> BasisCommitAnswer:
+    return BasisCommitAnswer(answer=ANSWER_HOLD, moved=moved, recovery=RECOVERY_REDERIVE)
+
+
+def _target_refusal(path: str, detail: ConflictDetail) -> TargetRefusal:
+    """A refused target compare-and-swap as the commit answer carries it,
+    apart from the basis members."""
+    return TargetRefusal(
+        path=path,
+        reason=detail.reason,
+        current_version=detail.current_version,
+        captured_generation=detail.captured_generation,
+        owner_generation=detail.owner_generation,
+    )
