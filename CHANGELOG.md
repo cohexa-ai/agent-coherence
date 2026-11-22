@@ -24,6 +24,24 @@ Alpha — APIs may change before `v1.0`.
   (`stderr_lines.json`), and the cross-runtime tests fail when the plugin's
   copy of the fixture files differs from this package's by a byte, lacks a
   file, or has one this package does not. The setting stays off by default.
+- **A refused compare-and-set on a substrate binding reports the token it
+  found, where the binding can read it.** `CasConflict` gains
+  `current_token`, keyword-only and `None` by default: a token the binding
+  read after the refusal, for logs and diagnostics. `CoherentRow.cas_write`
+  reads the row once after a refused `UPDATE` and reports its version, so a
+  refusal costs one more `SELECT`; `CoherentObject` reports `None`, since an
+  S3 412, 409 or 404 response carries no current ETag. `None` means the
+  binding could not report one, never "unchanged", and a read that returns the
+  expected token is not reported. It is a report value only: never pass it
+  back as `expected_token`; recovery is still a fresh read. A commit through
+  `CoordinatedSubstrate` still raises `CasVersionConflict` without it.
+  `CasConflict` compares the field too, so an exact `==` against
+  `CasConflict()` no longer matches a refusal that carries a token; use
+  `isinstance`. The native-CAS conformance run now checks that a refused bare
+  `cas_write` reports either no token or the token read after the refusal,
+  never the comparand; a binding that returns `CasConflict()` passes
+  unchanged. A binding that sets the field needs a library release newer than
+  0.16.1.
 
 ### Fixed
 
