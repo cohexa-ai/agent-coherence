@@ -3634,6 +3634,44 @@ def test_on_stale_write_allow_proceeds_and_clobbers(
         stop_coordinator(tmp_path)
 
 
+
+def test_foreign_write_with_the_hash_guard_off_is_reported_not_refused(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """With ``on_stale_write="allow"`` the volume's own disk-content check is off,
+    so this shows what the coordinator alone does when a foreign write modifies a
+    managed file on disk between the agent's read and its write-back.
+
+    The tracked version stays N: nothing records the foreign write. A
+    compare-and-set at N is refused by the coordinator, which denies the
+    hash-checked read it needs (``ViewWedged``) whatever ``on_stale_write`` says.
+    The plain ``write()`` is admitted and lands over the foreign bytes; the
+    coordinator only reports them as it admits it (``disk_differs``), and the
+    version moves to N+1. Only the volume's default hash guard (``"raise"``, see
+    ``test_write_denies_foreign_edit_by_default``) refuses that write-back. This
+    holds on a managed path and for a modification: after a foreign delete,
+    ``write()`` is neither refused nor reported, and a compare-and-set fails in
+    the volume with ``FileNotFoundError``."""
+    target = _seed_file(tmp_path, content=b"v1")  # on disk only: no commit of our own
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_stale_write="allow", config=fast_cfg)
+    try:
+        vol.read("data/x.txt")
+        version = _tracked_version(vol, "data/x.txt")
+        target.write_bytes(b"foreign")  # a foreign write: not through the coordinator
+        assert _tracked_version(vol, "data/x.txt") == version
+
+        with pytest.raises(ViewWedged):
+            vol.write_cas_at("data/x.txt", version, b"mine-cas")
+        assert _tracked_version(vol, "data/x.txt") == version
+        assert target.read_bytes() == b"foreign"
+
+        result = vol.write("data/x.txt", b"mine")  # no read() since the foreign write
+        assert result.disk_differs is True
+        assert target.read_bytes() == b"mine"
+        assert _tracked_version(vol, "data/x.txt") == version + 1
+    finally:
+        stop_coordinator(tmp_path)
+
 def test_write_after_foreign_delete_proceeds(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
