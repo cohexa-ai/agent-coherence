@@ -621,7 +621,7 @@ jobs:
       - name: Run the gated tests against Postgres
         timeout-minutes: 10
         env:
-          CCS_TEST_PG_DSN: postgresql://postgres@127.0.0.1:5432/postgres
+          CCS_TEST_PG_DSN: ""
         run: >-
           pytest -v -rs --tb=short -m real_substrate -n 0
           --junitxml=real-postgres/junit.xml
