@@ -42,6 +42,22 @@ Alpha — APIs may change before `v1.0`.
   never the comparand; a binding that returns `CasConflict()` passes
   unchanged. A binding that sets the field needs a library release newer than
   0.16.1.
+- **CI runs the Postgres binding against a real Postgres server.** A new
+  **Real Postgres** job, not a required check, starts a Postgres 17 server
+  pinned by image digest and runs the `real_substrate` tests in
+  `tests/adapters/test_coherent_row.py` and
+  `tests/conformance/test_tier_honesty.py` with only `CCS_TEST_PG_DSN` set.
+  These tests skip themselves without their variables, so a guard
+  (`tools/real_postgres_guard.py`) reads the run's JUnit report and fails the
+  job unless six named tests passed and only two skipped, each for its own
+  reason: the limited-role trigger test (no `CCS_TEST_PG_LIMITED_DSN`) and the
+  real S3 arm (no `CCS_REAL_S3_BUCKET`). The outside-write test now checks by
+  value: after a separate session updates the row from version 1 to 2, the
+  agent's `cas_write` at 1 returns a `CasConflict` with `current_token` `"2"`,
+  and `write()` raises `CasVersionConflict` with expected version 1 and current
+  version 2. A default-suite test checks the guard's lists against the tests
+  the job collects, so a renamed test, a lost marker or an edited skip reason
+  fails before it reaches the job.
 
 ### Changed
 

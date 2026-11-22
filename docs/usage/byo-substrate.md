@@ -228,3 +228,42 @@ export CCS_TEST_PG_DSN="postgresql://…"
 export CCS_REAL_S3_BUCKET="…"
 pytest -m real_substrate
 ```
+
+With no path, that also selects the other real-substrate test files, the S3
+binding's tests among them.
+
+**What CI runs.** The **Real Postgres** job runs on every pull request. It
+starts a Postgres 17 server pinned by image digest, sets only
+`CCS_TEST_PG_DSN`, and runs:
+
+```bash
+pytest -m real_substrate -n 0 \
+  tests/adapters/test_coherent_row.py tests/conformance/test_tier_honesty.py
+```
+
+Every real-substrate test skips itself when its variable is unset, so a green
+pytest run could mean nothing ran. A guard (`tools/real_postgres_guard.py`)
+reads the run's JUnit report and fails the job unless:
+
+- **six tests passed:** five `CoherentRow` tests that need only the owner DSN
+  (two agents racing on one row, with one winner; the trigger, not the client,
+  setting the version; a write from outside the binding refusing the agent's
+  compare-and-set at the version it read, with the refusal naming the version
+  that overtook it; a write whose outcome was unknown, reconciled by its
+  token; and the 32-bit `xmin` hazard that is why the binding uses its own
+  version column), plus the native compare-and-set conformance run against
+  Postgres;
+- **two tests skipped, each for its own reason:** the limited-role trigger test,
+  which needs a non-owner role in `CCS_TEST_PG_LIMITED_DSN`, and the real S3
+  arm, which needs a bucket in `CCS_REAL_S3_BUCKET`. The job sets neither.
+
+Any other outcome fails the job and names the test: a failure or an error, a
+skip for another reason, a test the guard does not list, or a listed test that
+did not run. The job is not a required check.
+
+The outside-write test does not prove that the outside write is seen before the
+agent writes, only that the agent's write is refused and the refusal names the
+version that overtook it. Its outside writer is a separate database session in
+the same process, not another process or host. It covers the binding on its
+own: not a commit through `CoordinatedSubstrate`, not a write to a different
+row, and not a Postgres-backed registry.
