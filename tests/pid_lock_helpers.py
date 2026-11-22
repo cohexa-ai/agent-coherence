@@ -54,7 +54,5 @@ def release_coordinator_lock(pid_file: Path) -> None:
 def release_coordinator_locks() -> None:
     """Release every lock :func:`hold_coordinator_lock` took: the stand-in
     coordinators exit."""
-    while _HELD:
-        _, fd = _HELD.popitem()
-        with suppress(OSError):
-            os.close(fd)
+    for pid_file in list(_HELD):
+        release_coordinator_lock(pid_file)

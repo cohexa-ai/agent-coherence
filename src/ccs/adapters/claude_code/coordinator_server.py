@@ -1241,8 +1241,6 @@ class CoordinatorHTTPServer:
         self._started_at = time.monotonic()
         self._last_request_at = self._started_at
         self._shutting_down = False
-        # The owner's way to stop this coordinator, when it has one: see
-        # install_shutdown_sequence.
         self._shutdown_sequence: Callable[[], object] | None = None
         # ADV-001 (fix): "migration draining" is a halfway state between
         # serving and shutting_down. While true, new pre-edit requests are
