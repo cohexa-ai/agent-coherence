@@ -47,7 +47,8 @@ Alpha — APIs may change before `v1.0`.
   `POST /admin/prepare-for-migration` did the same. The route now stops the
   coordinator through the same sequence as an idle stop, which takes the port
   out of `server.pid`, frees the lock and lets the worker exit, and the command
-  reports a clean stop only once the lock is free. If the lock is still held
+  reports a clean stop only once the lock is free, including when it finds a
+  `server.pid` with no port. If the lock is still held, or cannot be checked,
   15 seconds after the port closed, it exits `2`.
 
 ## [0.16.1] - 2026-11-15

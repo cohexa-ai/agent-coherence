@@ -342,7 +342,8 @@ To take that copy:
    releases every write grant it holds and shuts it down, and does nothing when
    no coordinator is running. It reports a clean stop only once the coordinator
    has let go of the workspace lock, so a new one can start, and exits `2` if
-   the lock is still held 15 seconds after the port closed. Do this before upgrading even if you skip the
+   the lock is still held, or cannot be checked, 15 seconds after the port
+   closed. Do this before upgrading even if you skip the
    copy: a 0.14.1 coordinator left running keeps serving the upgraded clients
    until it exits.
 3. Copy the directory with its permissions, for example

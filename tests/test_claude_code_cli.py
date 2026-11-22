@@ -1171,6 +1171,54 @@ def test_prepare_for_migration_does_not_say_clean_while_the_workspace_lock_is_he
     assert "clean" not in captured.out
 
 
+def test_prepare_for_migration_does_not_say_clean_when_the_lock_cannot_be_checked(
+    live_coordinator, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Prevents a lock probe that fails from reading as a free lock and a
+    clean stop: here server.pid turns into a link as the port closes."""
+    workspace, _port = live_coordinator
+    coordinator = lifecycle._SPAWNED_REGISTRY[str(workspace.resolve())].coordinator
+    pid_file = workspace / ".coherence" / "server.pid"
+
+    def stop_and_hide_the_lock() -> None:
+        coordinator.shutdown()
+        moved = pid_file.with_name("server.pid.moved")
+        pid_file.rename(moved)
+        pid_file.symlink_to(moved)
+
+    coordinator.install_shutdown_sequence(stop_and_hide_the_lock)
+    monkeypatch.setattr(coherence_coordinator, "_LOCK_RELEASE_TIMEOUT_SEC", 0.5)
+
+    rc = coherence_coordinator.main(["--root", str(workspace), "--prepare-for-migration"])
+
+    captured = capsys.readouterr()
+    assert rc == 2, captured
+    assert "could not be checked" in captured.err
+    assert "clean" not in captured.out
+
+
+def test_prepare_for_migration_waits_for_the_lock_when_the_pid_file_has_no_port(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Prevents a pid file whose port is gone while its lock is still held,
+    as a stop stuck after dropping its port leaves it, from reading as a
+    clean stop."""
+    coherence = git_workspace / ".coherence"
+    coherence.mkdir()
+    pid_file = coherence / "server.pid"
+    pid_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    (coherence / "hook.secret").write_text("test-token\n", encoding="utf-8")
+    hold_coordinator_lock(pid_file)
+    monkeypatch.setattr(coherence_coordinator, "_LOCK_RELEASE_TIMEOUT_SEC", 0.5)
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace), "--prepare-for-migration"])
+
+    captured = capsys.readouterr()
+    assert rc == 2, captured
+    assert "still holds the workspace lock" in captured.err
+    assert "treating as clean" not in captured.out
+
+
 def _assert_stopped_so_a_start_can_follow(workspace: Path) -> None:
     """server.pid names no port, its lock is free, and a fresh start in
     this workspace binds a coordinator that answers."""

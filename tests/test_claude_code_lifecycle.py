@@ -130,6 +130,33 @@ def test_ensure_coordinator_first_call_binds_and_writes_port(
         stop_coordinator(workspace)
 
 
+def test_the_owners_stop_is_installed_before_the_port_is_published(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prevents a prepare-for-migration request that arrives the moment the
+    port is published from stopping the coordinator through shutdown() alone,
+    which leaves the worker holding the workspace lock (#510)."""
+    events: list[str] = []
+    real_install = CoordinatorHTTPServer.install_shutdown_sequence
+    real_publish = lifecycle._write_pidfile
+
+    def install(self: CoordinatorHTTPServer, sequence) -> None:
+        events.append("install")
+        real_install(self, sequence)
+
+    def publish(*args) -> None:
+        events.append("publish")
+        real_publish(*args)
+
+    monkeypatch.setattr(CoordinatorHTTPServer, "install_shutdown_sequence", install)
+    monkeypatch.setattr(lifecycle, "_write_pidfile", publish)
+    try:
+        assert ensure_coordinator(workspace, config=fast_cfg) > 0
+    finally:
+        stop_coordinator(workspace)
+    assert events[:2] == ["install", "publish"]
+
+
 def test_ensure_coordinator_second_call_same_process_returns_same_port(
     workspace: Path, fast_cfg: LifecycleConfig
 ) -> None:

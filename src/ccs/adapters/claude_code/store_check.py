@@ -333,18 +333,20 @@ def store_is_held(coordinator_root: Path) -> bool:
         return False
 
 
-def workspace_lock_held(coordinator_root: Path) -> bool:
-    """True when a coordinator holds the workspace lock on
+def workspace_lock_held(coordinator_root: Path) -> bool | None:
+    """Whether a coordinator holds the workspace lock on
     ``coordinator_root``'s ``.coherence/server.pid``, as the check's own probe
-    reads it. A coordinator can stop serving and still hold it, and no start
-    can follow until it lets go (#510). Creates nothing; a probe that fails,
-    or no ``fcntl``, reads as not held."""
+    reads it: True, False, or None when the probe itself fails (the file is a
+    link, not a regular file, or unreadable), which says nothing either way. A
+    coordinator can stop serving and still hold the lock, and no start can
+    follow until it lets go (#510). Creates nothing; with no ``fcntl`` no lock
+    can be held, so False."""
     if not _FCNTL_AVAILABLE:
         return False
     try:
         return _coordinator_holds_lock(Path(coordinator_root) / ".coherence" / "server.pid")
     except _CheckStopped:
-        return False
+        return None
 
 
 def _store_held(db_path: Path) -> bool:

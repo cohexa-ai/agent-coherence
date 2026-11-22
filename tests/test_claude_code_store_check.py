@@ -54,6 +54,7 @@ from tests.coordinator.test_checkpoint_registration_schema import (
     _revert_to_v9_shape,
 )
 from tests.coordinator_helpers import no_sqlite_connection_left_open
+from tests.pid_lock_helpers import hold_coordinator_lock, release_coordinator_lock
 from tests.store_images import kill_writer_mid_flight
 from tests.test_sqlite_registry import (
     _build_raw_v1_db,
@@ -358,6 +359,24 @@ def test_check_store_answers_what_the_spawn_does_and_touches_nothing(
     assert _spawn_truth(root, tmp_path / "truth") == _truth(outcome, found)
     # Only a store that exists is copied; an absent one is answered from a stat.
     assert len(copies) == (0 if shape == "absent" else 1)
+
+
+def test_workspace_lock_held_tells_held_free_and_cannot_tell(tmp_path: Path) -> None:
+    """Prevents a lock probe that fails from reading as a free lock, which let
+    prepare-for-migration report a stop it could not check (#510)."""
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    pid_file = coherence / "server.pid"
+    assert store_check.workspace_lock_held(tmp_path) is False, "no server.pid"
+    pid_file.write_text("1\n")
+    assert store_check.workspace_lock_held(tmp_path) is False, "nobody holds it"
+    hold_coordinator_lock(pid_file)
+    assert store_check.workspace_lock_held(tmp_path) is True
+    release_coordinator_lock(pid_file)
+    moved = coherence / "server.pid.moved"
+    pid_file.rename(moved)
+    pid_file.symlink_to(moved)
+    assert store_check.workspace_lock_held(tmp_path) is None, "a link is never probed"
 
 
 def test_a_negative_user_version_reads_unusable_with_a_backup_remedy(
