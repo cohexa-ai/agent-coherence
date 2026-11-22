@@ -396,7 +396,9 @@ class CoherentRow:
 
         Returns a typed outcome: :class:`~ccs.adapters.substrate.CasWritten` (the
         new token from ``RETURNING``), :class:`~ccs.adapters.substrate.CasConflict`
-        (``rowcount == 0`` — the version moved, nothing landed), or
+        (``rowcount == 0`` — nothing landed; ``current_token`` is the version a
+        read after the refusal found, or ``None`` when that read finds no row, an
+        unusable version or the expected one, or fails), or
         :class:`~ccs.adapters.substrate.CasUnknown` (a driver operational failure
         mid-write — the write may or may not be durable; reconcile via
         :meth:`reconcile_after_unknown`).
@@ -415,7 +417,9 @@ class CoherentRow:
                 self._discard_owned_connection()
                 return CasUnknown()
             raise self._scrubbed(exc, "cas_write") from None
-        if rowcount == 0 or row is None:
+        if rowcount == 0:
+            return CasConflict(current_token=self._token_after_refusal(artifact_ref, expected_version))
+        if row is None:
             return CasConflict()
         (new_version,) = row
         return CasWritten(token=str(self._require_valid_version(new_version)))
@@ -531,6 +535,23 @@ class CoherentRow:
                 self._discard_owned_connection()
             raise self._scrubbed(exc, "read") from None
         return row
+
+    def _token_after_refusal(self, artifact_ref: str, expected_version: int) -> SubstrateToken | None:
+        """The row's token read after a refused UPDATE, as a report only.
+
+        The refusal already committed, so a failed read reports nothing rather
+        than turning a confirmed conflict into an unknown outcome or an error. A
+        read-back equal to the expected version (a re-inserted row, a disabled
+        trigger) is not reported: it would invite re-driving the stale comparand.
+        """
+        try:
+            row = self._fetch_row(artifact_ref)
+        except CoherenceError as exc:  # already scrubbed; an owned conn is dropped
+            logger.debug("CoherentRow could not read the row after a refused write: %s", type(exc).__name__)
+            return None
+        if row is None or not _is_usable_version(row[1]) or row[1] == expected_version:
+            return None
+        return str(int(row[1]))
 
     def _current_version_or_wedged(self, artifact_ref: str) -> int:
         row = self._fetch_row(artifact_ref)

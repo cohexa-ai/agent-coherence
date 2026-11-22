@@ -21,6 +21,7 @@ import importlib.util
 import os
 import sys
 import types
+from collections.abc import Callable
 
 import pytest
 
@@ -68,7 +69,9 @@ class _FakeConnection:
     ``rows`` maps an id to ``(value, version)``. An ``UPDATE ... WHERE version =
     ?`` only matches when the stored version equals the expected one, and lands
     ``OLD.version + 1`` (the owner-trigger semantics). Set ``raise_on_execute`` /
-    ``raise_on_commit`` to simulate a driver failure.
+    ``raise_on_commit`` to simulate a driver failure, ``raise_on_select`` to fail
+    only the reads, and ``after_update`` to run another writer's change between
+    an UPDATE and the next statement.
     """
 
     def __init__(self, rows: dict[str, tuple[bytes, int]] | None = None) -> None:
@@ -78,6 +81,8 @@ class _FakeConnection:
         self.rolled_back = 0
         self.raise_on_execute: BaseException | None = None
         self.raise_on_commit: BaseException | None = None
+        self.raise_on_select: BaseException | None = None
+        self.after_update: Callable[[dict[str, tuple[bytes, int]]], None] | None = None
         self._last_row: tuple | None = None
         self._last_rowcount = 0
 
@@ -97,6 +102,8 @@ class _FakeConnection:
         if self.raise_on_execute is not None:
             raise self.raise_on_execute
         if sql.lstrip().upper().startswith("SELECT"):
+            if self.raise_on_select is not None:
+                raise self.raise_on_select
             (ref,) = params
             row = self.rows.get(ref)
             self._last_row = row
@@ -112,6 +119,8 @@ class _FakeConnection:
             else:
                 self._last_row = None
                 self._last_rowcount = 0
+            if self.after_update is not None:
+                self.after_update(self.rows)
 
 
 @pytest.fixture
@@ -183,6 +192,94 @@ def test_cas_write_conflict_on_zero_rowcount() -> None:
     outcome = _row(conn).cas_write("k", expected_token="5", new_bytes=b"new")
     assert isinstance(outcome, CasConflict)
     assert conn.rows["k"] == (b"old", 6)  # nothing landed
+    assert outcome.current_token == _row(conn).read("k")[1] == "6"
+
+
+def test_a_refusal_reports_the_token_read_back_not_one_computed() -> None:
+    """Another writer moved the row twice: the refusal reports what a read
+    returns afterwards, not the next version after the comparand."""
+    conn = _FakeConnection({"k": (b"seed", 5)})
+    conn.rows["k"] = (b"outside-1", 6)
+    conn.rows["k"] = (b"outside-2", 7)
+    outcome = _row(conn).cas_write("k", expected_token="5", new_bytes=b"mine")
+    assert isinstance(outcome, CasConflict)
+    assert outcome.current_token == "7"
+
+
+def test_a_refusal_reports_a_write_that_landed_after_it() -> None:
+    """The token is read after the refusal, so a write landing between the
+    refused UPDATE and that read is what gets reported."""
+    conn = _FakeConnection({"k": (b"peer", 6)})
+    conn.after_update = lambda rows: rows.__setitem__("k", (b"later", 7))
+    outcome = _row(conn).cas_write("k", expected_token="5", new_bytes=b"mine")
+    assert isinstance(outcome, CasConflict)
+    assert outcome.current_token == "7"
+
+
+@pytest.mark.parametrize(
+    "after_refusal",
+    [
+        pytest.param(lambda rows: rows.__setitem__("k", (b"re-inserted", 5)), id="expected-version-read-back"),
+        pytest.param(lambda rows: rows.pop("k"), id="row-deleted"),
+        pytest.param(lambda rows: rows.__setitem__("k", (b"legacy", 0)), id="sentinel-version"),
+    ],
+)
+def test_a_refusal_reports_no_token_it_cannot_vouch_for(
+    after_refusal: Callable[[dict[str, tuple[bytes, int]]], None],
+) -> None:
+    """A read-back equal to the comparand would invite re-driving it, and a
+    vanished row or unusable version has no token: all report None, no raise."""
+    conn = _FakeConnection({"k": (b"peer", 6)})
+    conn.after_update = after_refusal
+    outcome = _row(conn).cas_write("k", expected_token="5", new_bytes=b"mine")
+    assert isinstance(outcome, CasConflict)
+    assert outcome.current_token is None
+
+
+@pytest.mark.parametrize("error_name", ["OperationalError", "ProgrammingError"])
+def test_a_failed_read_after_a_refusal_keeps_the_refusal(
+    fake_psycopg: types.ModuleType, error_name: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The refusal is confirmed before the read, so a failing read reports no
+    token rather than an unknown outcome or an error, and leaks no DSN text."""
+    conn = _FakeConnection({"k": (b"peer", 6)})
+    conn.raise_on_select = getattr(fake_psycopg, error_name)("down; dsn=postgresql://u:hunter2@db/app")
+    with caplog.at_level("DEBUG", logger="ccs.adapters.coherent_row"):
+        outcome = _row(conn).cas_write("k", expected_token="5", new_bytes=b"mine")
+    assert isinstance(outcome, CasConflict)
+    assert outcome.current_token is None
+    assert conn.rolled_back >= 1
+    assert "hunter2" not in caplog.text
+
+
+def test_a_failed_read_after_a_refusal_drops_an_owned_connection(
+    fake_psycopg: types.ModuleType,
+) -> None:
+    conns: list[_FakeConnection] = []
+
+    def fake_connect(dsn, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        conn = _FakeConnection({"k": (b"peer", 6)})
+        if not conns:
+            conn.raise_on_select = fake_psycopg.OperationalError("server closed")  # type: ignore[attr-defined]
+        conns.append(conn)
+        return conn
+
+    fake_psycopg.connect = fake_connect  # type: ignore[attr-defined]
+    row = CoherentRow(table="workspace_rows", dsn="postgresql://u:sec@db/app")
+    outcome = row.cas_write("k", expected_token="5", new_bytes=b"mine")
+    assert isinstance(outcome, CasConflict) and outcome.current_token is None
+    assert row.read("k") == (b"peer", "6")  # the next call dials a fresh connection
+    assert len(conns) == 2
+
+
+def test_a_failed_read_after_a_refusal_keeps_a_borrowed_connection(
+    fake_psycopg: types.ModuleType,
+) -> None:
+    conn = _FakeConnection({"k": (b"peer", 6)})
+    conn.raise_on_select = fake_psycopg.OperationalError("server closed")  # type: ignore[attr-defined]
+    row = _row(conn)
+    row.cas_write("k", expected_token="5", new_bytes=b"mine")
+    assert row._connection is conn  # caller-owned: never dropped
 
 
 def test_cas_write_unknown_on_operational_error_during_execute(
