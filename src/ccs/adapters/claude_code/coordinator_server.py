@@ -145,6 +145,8 @@ from ccs.coordinator.registry_protocol import (
     WatchdogAbort,
 )
 from ccs.coordinator.service import (
+    BASIS_MAX_MEMBERS,
+    BasisResolve,
     CallerPrincipalUncached,
     CoordinatorService,
     ReleaseRequest,
@@ -155,12 +157,22 @@ from ccs.coordinator.sqlite_registry import (
     SqliteArtifactRegistry,
     row_registration,
 )
+from ccs.core.basis import (
+    ANSWER_HOLD,
+    ANSWER_PROCEED,
+    RECOVERY_RETRY,
+    BasisCheckAnswer,
+    BasisCommitAnswer,
+    BasisMember,
+    TargetRefusal,
+)
 from ccs.core.clock import monotonic_seconds
 from ccs.core.disk_spelling import native_spelling
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_ABSENT_REASON,
     CALLER_PRINCIPAL_FOREIGN_REASON,
     CHECKPOINT_UNKNOWN_REASON,
+    COMMIT_UNCONFIRMED_REASON,
     GIVER_FENCED_REASON,
     HANDLER_FAILURE_REASON_PREFIX,
     HANDOFF_ACCEPT_UNCONFIRMED_REASON,
@@ -175,6 +187,7 @@ from ccs.core.exceptions import (
     HOLD_REASONS,
     HOLD_VERSION_UNCONFIRMED,
     OCC_CALLER_TRANSIENT_REASON,
+    OCC_IS_SHARED_OR_INVALID_ONLY_REASON,
     OTHER_HOLDER_REASON,
     POLICY_FILE_UNLOADABLE_KIND,
     POLICY_LOCK_NOT_REGULAR_KIND,
@@ -727,6 +740,18 @@ _CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
         "without the giver's principal could withdraw the handoff, so the "
         "giver's late write would land where its successor was told to "
         "write")),
+    # -- the basis check and the commit under a basis -------------------------
+    ("POST", "/basis/check"): RoutePrincipalPosture(_ACCEPT, (
+        "a read: compares the versions and registrations a caller recorded "
+        "with the coordinator's rows and answers proceed or hold. The answer "
+        "does not depend on who asks, and the check registers, grants, drains "
+        "and records nothing for the named identity. Accepted behaviour for an "
+        "absent principal: a caller naming a bound peer learns only what any "
+        "caller asking about the same paths learns")),
+    ("POST", "/basis/commit"): RoutePrincipalPosture(_REQUIRE, (
+        "the optimistic commit under a recorded basis: bumps the target's "
+        "version and records last_writer_id under the named identity, and "
+        "completes or overtakes a handoff of the target as that identity")),
 }
 """Route -> caller-principal posture, over EVERY route that reads a
 ``session_id`` and no other. The require-class harm is what an absent
@@ -1388,6 +1413,9 @@ class CoordinatorHTTPServer:
             "handoff_accept_total": 0,
             "handoff_decline_total": 0,
             "handoff_withdraw_total": 0,
+            # The basis check and the commit under a basis, on the same rule.
+            "basis_check_total": 0,
+            "basis_commit_total": 0,
         }
         self._endpoint_counters_lock = threading.Lock()
 
@@ -3695,6 +3723,418 @@ def _handle_effect_fence(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     )
 
 
+# ----------------------------------------------------------------------
+# POST /basis/check and POST /basis/commit
+# ----------------------------------------------------------------------
+#
+# A caller that read several files records, for each, the version (and the
+# registration) it read. /basis/check answers whether every one is still what
+# it read, at one instant; /basis/commit compare-and-swaps one target only
+# while they all are. The service's check_basis and commit_if_basis do the
+# work under one hold of its session lock and the registry lock; these routes
+# add the strict schema, the request door (each member is found by lookup
+# only, under the name every path-taking route computes), and an answer for
+# every state the coordinator cannot confirm in time. Python coordinator only:
+# the Node backend answers 404.
+
+_BASIS_CHECK_ROUTE: tuple[str, str] = ("POST", "/basis/check")
+_BASIS_COMMIT_ROUTE: tuple[str, str] = ("POST", "/basis/commit")
+
+_BASIS_CHECK_FIELDS: frozenset[str] = frozenset({"session_id", "agent_id", "basis"})
+_BASIS_COMMIT_FIELDS: frozenset[str] = _BASIS_CHECK_FIELDS | {"target", "content_hash"}
+_BASIS_MEMBER_FIELDS: frozenset[str] = frozenset({"path", "version", "registration", "name_kind"})
+"""The strict schema of the two routes and of a member (the target is
+described like one). Any other field is a 400, ``agentId`` and
+``subagent_id`` included: the hook routes' fallback spelling of the subagent
+id is not read here, so a request has one reading."""
+
+_BASIS_LOCK_RESERVE_SEC = 0.5
+"""How long before the handler watchdog's deadline the basis routes stop
+waiting for the service and registry locks. A lock won by then leaves the
+evaluation (milliseconds, even at the member cap) time to answer before the
+deadline, so contention gets the route's own definite answer that nothing ran
+rather than the watchdog's."""
+
+
+def _unconfirmed_check(held_by: str) -> dict:
+    """The check's hold when it compared nothing: nothing is known to have
+    moved, so the same request may succeed later (``retry``)."""
+    answer = BasisCheckAnswer(
+        answer=ANSWER_HOLD, reason=HOLD_VERSION_UNCONFIRMED, recovery=RECOVERY_RETRY,
+    )
+    return {**answer.to_wire(), "degraded": True, "held_by": held_by}
+
+
+def _unknown_commit(held_by: str) -> dict:
+    """The commit's hold when it may have landed. It carries no recovery
+    class: retrying is wrong if it landed, and re-deriving is wrong if it did
+    not, so the caller re-reads the target first."""
+    return BasisCommitAnswer(
+        answer=ANSWER_HOLD, reason=COMMIT_UNCONFIRMED_REASON, degraded=True, held_by=held_by,
+    ).to_wire()
+
+
+_BASIS_CHECK_DEGRADED_RESPONSE: dict = _unconfirmed_check("watchdog_timeout")
+"""``/basis/check`` answered by the watchdog, or by its own work when the locks
+were not won in time: one body for both, since neither compared anything. A
+proceed shape here would be a claim about state nothing looked at."""
+
+_BASIS_CHECK_INTERNAL_HOLD_RESPONSE: dict = _unconfirmed_check("handler_error")
+"""``/basis/check`` when its work or its caller-principal gate raised."""
+
+_BASIS_COMMIT_DEGRADED_RESPONSE: dict = _unknown_commit("watchdog_timeout")
+"""``/basis/commit`` answered by the watchdog: its work may have won the
+registry guard and may still land, so it never says nothing landed."""
+
+_BASIS_COMMIT_INTERNAL_HOLD_RESPONSE: dict = _unknown_commit("handler_error")
+"""``/basis/commit`` when its work or its gate raised, possibly after a win."""
+
+_BASIS_COMMIT_NOTHING_RAN_RESPONSE: dict = BasisCommitAnswer(
+    answer=ANSWER_HOLD, reason=HOLD_VERSION_UNCONFIRMED, recovery=RECOVERY_RETRY,
+).to_wire()
+"""``/basis/commit`` when its own work could not take the locks by its
+deadline: nothing was read or written, so the same request may succeed later."""
+
+
+@dataclass(frozen=True)
+class _BasisRequest:
+    """A validated basis request, as the service takes it: the members, a
+    commit's target and content hash, and every request name the resolver
+    looks up, computed before the hold."""
+
+    subagent_id: str | None
+    members: tuple[BasisMember, ...]
+    names: Mapping[str, RequestName]
+    target: BasisMember | None = None
+    content_hash: str | None = None
+
+
+_ReadMember = tuple[BasisMember, RequestName]
+
+
+def _unknown_fields(body: dict, allowed: frozenset[str]) -> str | None:
+    """The 400 text naming every field of ``body`` outside ``allowed``."""
+    extra = sorted(set(body) - allowed)
+    return f"unknown field {', '.join(map(repr, extra))}" if extra else None
+
+
+def _read_basis_member(raw: object, coordinator: CoordinatorHTTPServer, what: str) -> _ReadMember | str:
+    """One member (or the target) and its request name, or the 400 text
+    prefixed with ``what``. The path and ``name_kind`` pass the gate every
+    path-taking route runs before any lookup; the version and registration
+    are held to the rules :class:`BasisMember` enforces in process."""
+    if not isinstance(raw, dict):
+        return f"{what} must be an object of path, version, registration and name_kind"
+    unknown = _unknown_fields(raw, _BASIS_MEMBER_FIELDS)
+    if unknown is not None:
+        return f"{what}: {unknown}"
+    name = _read_request_name(raw, coordinator)
+    if isinstance(name, str):
+        return f"{what}: {name}"
+    try:
+        member = BasisMember(name.requested, raw.get("version"), raw.get("registration"), name.kind)
+    except ValueError as exc:
+        return f"{what}: {exc}"
+    return member, name
+
+
+def _names_one_row(one: _ReadMember, other: _ReadMember) -> bool:
+    """Whether two described members reach one row as far as the request
+    shows: the same path, two spellings the door keys alike, or the same
+    registration. One row may carry only one comparand."""
+    (member, name), (other_member, other_name) = one, other
+    return (
+        member.path == other_member.path
+        or (name.kind, name.key) == (other_name.kind, other_name.key)
+        or (member.registration is not None and member.registration == other_member.registration)
+    )
+
+
+def _read_basis_members(raw: object, coordinator: CoordinatorHTTPServer) -> list[_ReadMember] | str:
+    """The basis, or the 400 text: a non-empty list of at most
+    :data:`BASIS_MAX_MEMBERS` well-formed members, no two reaching one row."""
+    if not isinstance(raw, list) or not raw:
+        return "basis must be a non-empty list of members"
+    if len(raw) > BASIS_MAX_MEMBERS:
+        return f"basis names at most {BASIS_MAX_MEMBERS} members, got {len(raw)}"
+    read: list[_ReadMember] = []
+    for index, item in enumerate(raw):
+        member = _read_basis_member(item, coordinator, f"basis[{index}]")
+        if isinstance(member, str):
+            return member
+        if any(_names_one_row(member, earlier) for earlier in read):
+            return f"basis[{index}]: basis names one path, file or registration twice"
+        read.append(member)
+    return read
+
+
+def _read_basis_target(
+    raw: object, read: list[_ReadMember], coordinator: CoordinatorHTTPServer
+) -> _ReadMember | str:
+    """The commit's target, or the 400 text. A target that names a member
+    must be that member: the same file, version and registration, so one row
+    never carries two comparands."""
+    target = _read_basis_member(raw, coordinator, "target")
+    if isinstance(target, str):
+        return target
+    named = [member for member in read if _names_one_row(target, member)]
+    if not named:
+        return target
+    (member, name), (described, described_name) = named[0], target
+    if len(named) > 1 or (name.kind, name.key, member.version, member.registration) != (
+        described_name.kind, described_name.key, described.version, described.registration,
+    ):
+        return "target names a basis member but disagrees with its path, version or registration"
+    return target
+
+
+def _commit_hash_error(content_hash: object) -> str | None:
+    """The 400 text for a commit's ``content_hash``, required as on
+    ``/hooks/post-edit-cas`` and named when missing, or ``None``."""
+    if content_hash is None:
+        return "missing content_hash"
+    return validate_content_hash(content_hash, required=True)
+
+
+def _read_basis_request(
+    body: dict, coordinator: CoordinatorHTTPServer, *, commit: bool
+) -> _BasisRequest | str:
+    """A request whose session id is already valid, checked against the
+    strict schema, or the 400 text: the fields, the basis, a commit's target
+    and content hash, then the subagent id, which is refused when malformed
+    rather than read as the parent, as the effect fence refuses it."""
+    error = _unknown_fields(body, _BASIS_COMMIT_FIELDS if commit else _BASIS_CHECK_FIELDS)
+    if error is not None:
+        return error
+    read = _read_basis_members(body.get("basis"), coordinator)
+    if isinstance(read, str):
+        return read
+    target = _read_basis_target(body.get("target"), read, coordinator) if commit else None
+    if isinstance(target, str):
+        return target
+    content_hash = body.get("content_hash")
+    if commit:
+        error = _commit_hash_error(content_hash)
+        if error is not None:
+            return error
+    if has_malformed_subagent_id(body):
+        return _MALFORMED_SUBAGENT_ERROR
+    described = [*read, *([target] if target is not None else [])]
+    return _BasisRequest(
+        subagent_id=read_subagent_id(body),
+        members=tuple(member for member, _ in read),
+        names={member.path: name for member, name in described},
+        target=None if target is None else target[0],
+        content_hash=content_hash if commit else None,
+    )
+
+
+def _basis_resolver(coordinator: CoordinatorHTTPServer, names: Mapping[str, RequestName]) -> BasisResolve:
+    """The service's resolver over the request door, run inside its hold:
+    the row a member's name reaches, by lookup only (never registering one,
+    so an unknown member holds and no row is minted), and whether the path is
+    tracked."""
+
+    def resolve(member: BasisMember) -> tuple[UUID | None, bool]:
+        name = names[member.path]
+        return find_requested(coordinator, name), is_tracked_request(coordinator, name)
+
+    return resolve
+
+
+def _basis_lock_deadline(req: _RequestProtocol) -> float:
+    """When a basis route stops waiting for the locks:
+    :data:`_BASIS_LOCK_RESERVE_SEC` before the request's watchdog deadline,
+    started now unless the caller-principal gate already started it."""
+    return _start_watchdog_deadline(req) - _BASIS_LOCK_RESERVE_SEC
+
+
+def _basis_lock_timed_out(
+    coordinator: CoordinatorHTTPServer, effects: _AnswerEffects, answer: dict
+) -> dict:
+    """``answer`` for work that could not take the locks by its deadline,
+    counted as a watchdog timeout when it is the answer sent. A body the
+    watchdog already answered records nothing (``defer`` raises), so one
+    request is never counted twice."""
+
+    def record() -> None:
+        coordinator.increment_watchdog_timeout()
+        logger.warning("a basis request could not take the coordinator's locks in time; holding")
+
+    effects.defer(record)
+    return dict(answer)
+
+
+def _handle_basis_check(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /basis/check — is every recorded input still what was read?
+
+    Request::
+
+        {"session_id": "<uuid>", "agent_id": "<subagent id>",   # agent_id optional
+         "basis": [{"path": "<relative path>", "version": <int >= 1>,
+                    "registration": "<uuid>", "name_kind": "file"|"key"}, ...]}
+
+    ``registration`` and ``name_kind`` are optional; a member without a
+    registration is compared by version only. Answers, HTTP 200::
+
+        {"answer": "proceed", "checked": {path: {"expected", "current"}}}
+        {"answer": "hold", "moved": [{"path", "expected", "current", "reason"}],
+         "recovery": "rederive"}
+
+    and, when nothing could be compared in time or the work raised, the hold
+    with ``reason: version_unconfirmed``, ``recovery: retry``, ``degraded`` and
+    ``held_by``. A malformed request is a 400, never a hold.
+
+    Accept-class: the answer does not depend on who asks, and the check
+    registers, grants, drains and records nothing. Its work threads no abort
+    into the service: having written nothing, a late one is a late completion,
+    never the alarm about grants a late write may have left. Stays out of
+    ``_MIGRATION_REJECTED_ROUTES``: it initiates no write."""
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    request = _read_basis_request(body, coordinator, commit=False)
+    if isinstance(request, str):
+        req._json(400, {"error": request})
+        return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, request.subagent_id)) is None:
+        return
+    resolve = _basis_resolver(coordinator, request.names)
+    deadline = _basis_lock_deadline(req)
+    effects = _AnswerEffects()
+
+    def work() -> dict:
+        try:
+            answer = coordinator.service.check_basis(
+                request.members, resolve=resolve, deadline=deadline)
+        except RegistryLockTimeout:
+            return _basis_lock_timed_out(coordinator, effects, _BASIS_CHECK_DEGRADED_RESPONSE)
+        return answer.to_wire()
+
+    _run_or_degrade(
+        req, coordinator, work, degraded_response=_BASIS_CHECK_DEGRADED_RESPONSE, effects=effects,
+    )
+
+
+def _refuses_an_exclusive_holder(exc: CoherenceError) -> bool:
+    """Whether ``exc`` is the compare-and-swap's refusal of a caller that
+    already holds the target EXCLUSIVE or MODIFIED. The service raises that
+    precondition as a plain ``CoherenceError`` whose message carries the
+    reason token, so the token identifies it; any other ``CoherenceError`` is
+    no target refusal."""
+    return f"reason={OCC_IS_SHARED_OR_INVALID_ONLY_REASON}" in str(exc)
+
+
+def _target_precondition_hold(
+    coordinator: CoordinatorHTTPServer, request: _BasisRequest, exc: CoherenceError
+) -> dict:
+    """The hold for a target whose compare-and-swap precondition refused the
+    caller: the basis held and nothing was written, so ``moved`` is empty and
+    the target block carries the stable token, with the target's current
+    version read afterwards and, for a fenced giver, the successor and the
+    version at transfer."""
+    target = request.target
+    assert target is not None  # a commit request always carries one
+    artifact_id = find_requested(coordinator, request.names[target.path])
+    current = None if artifact_id is None else coordinator.registry.get_artifact(artifact_id)
+    version = None if current is None else current.version
+    if isinstance(exc, GiverFenced):
+        refusal = TargetRefusal(
+            target.path, GIVER_FENCED_REASON, version,
+            successor=str(exc.successor), version_at_transfer=exc.version_at_transfer,
+        )
+    elif isinstance(exc, OccCallerTransientError):
+        refusal = TargetRefusal(target.path, OCC_CALLER_TRANSIENT_REASON, version)
+    else:
+        refusal = TargetRefusal(target.path, OCC_IS_SHARED_OR_INVALID_ONLY_REASON, version)
+    return BasisCommitAnswer(answer=ANSWER_HOLD, target=refusal).to_wire()
+
+
+def _handle_basis_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /basis/commit — compare-and-swap the target only while every
+    recorded input is still what was read.
+
+    Request: ``/basis/check``'s, plus ``"target"`` (described like a member;
+    its ``version`` is the expected target version) and ``"content_hash"``
+    (64 hex). A target that names a member must be that member. Answers,
+    HTTP 200:
+
+    - won: ``{"answer": "proceed", "committed": {"path", "version"}}``, plus
+      the ``handoff`` key the compare-and-swap route attaches;
+    - a member or the target moved: the check's hold, nothing written;
+    - the basis held and the target's compare-and-swap was refused: ``hold``
+      with an empty ``moved`` and ``target: {path, reason, current_version}``
+      (plus the generation pair, or a fenced giver's ``successor`` and
+      ``version_at_transfer``), no recovery class;
+    - the locks not won in time: ``hold``, ``version_unconfirmed``, ``retry``;
+    - answered by the watchdog, or the work raised: ``hold`` with
+      ``reason: commit_unconfirmed``, ``degraded`` and ``held_by``, never a
+      claim that nothing landed.
+
+    Require-class, like ``/hooks/post-edit-cas``: the commit is attributed to
+    the agent the caller-principal gate admits, and it has no untracked fast
+    path (an untracked target holds). Refused during a migration drain."""
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    request = _read_basis_request(body, coordinator, commit=True)
+    if isinstance(request, str):
+        req._json(400, {"error": request})
+        return
+    agent_id = _admit_caller(req, coordinator, _presented_caller(req, session_id, request.subagent_id))
+    if agent_id is None:
+        return
+    # The display name for /status; the attributed id is agent_id above.
+    coordinator.register_session(session_id, request.subagent_id)
+    # The session-level identity the giver fence keys on, as the
+    # compare-and-swap route threads it.
+    caller = caller_principal_identity(session_id)
+    target = request.target
+    assert target is not None  # a commit request always carries one
+    resolve = _basis_resolver(coordinator, request.names)
+    deadline = _basis_lock_deadline(req)
+    now = monotonic_seconds()
+    effects = _AnswerEffects()
+
+    def work() -> dict:
+        try:
+            result = coordinator.service.commit_if_basis(
+                request.members, target, target.version,
+                agent_id=agent_id, caller=caller, content_hash=request.content_hash,
+                issued_at_tick=now, resolve=resolve, abort=effects.abort, deadline=deadline,
+            )
+        except RegistryLockTimeout:
+            return _basis_lock_timed_out(coordinator, effects, _BASIS_COMMIT_NOTHING_RAN_RESPONSE)
+        except (GiverFenced, OccCallerTransientError) as exc:
+            return _target_precondition_hold(coordinator, request, exc)
+        except CoherenceError as exc:
+            if not _refuses_an_exclusive_holder(exc):
+                raise
+            return _target_precondition_hold(coordinator, request, exc)
+        answer = result.answer.to_wire()
+        if not _commit_won(answer):
+            return answer
+        return _attach_handoff_key(
+            coordinator, answer, path=target.path, caller=caller, won_at=target.version)
+
+    # The watchdog's abort is the service's: work that reaches the registry
+    # guard after the watchdog answered aborts there, and work that won it
+    # first is reported as a late completion that may have landed.
+    _run_or_degrade(
+        req, coordinator, work, degraded_response=_BASIS_COMMIT_DEGRADED_RESPONSE, effects=effects,
+    )
+
+
 def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /hooks/pre-edit — acquire EXCLUSIVE (KTD-1) + KTD-9 collision surfacing."""
     body = req._read_json()
@@ -4372,7 +4812,7 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
         # return it, so it is read back: the win moved the version, so
         # the record it labelled is never relabelled and the read is stable.
         result = work()
-        won = result.get("ok") is True and "version" in result
+        won = _commit_won(result)
         return _attach_handoff_key(
             coordinator, result, path=path, caller=caller,
             won_at=expected_version if won else None,
@@ -6517,6 +6957,15 @@ def _win_outcome(record: TransferRecord, *, caller: UUID, won_at: int) -> str | 
     return None
 
 
+def _commit_won(result: dict) -> bool:
+    """Whether a commit route's answer is a compare-and-swap win, in either
+    shape: ``ok`` with the new ``version``, or a basis commit's ``proceed``.
+    Only a win passes its expected version to :func:`_attach_handoff_key`."""
+    if result.get("answer") == ANSWER_PROCEED:
+        return True
+    return result.get("ok") is True and "version" in result
+
+
 def _attach_handoff_key(
     coordinator: CoordinatorHTTPServer,
     result: dict,
@@ -8390,6 +8839,12 @@ _ROUTES: dict[tuple[str, str], Callable] = {
     ("POST", "/handoff/accept"): _handle_handoff_accept,
     ("POST", "/handoff/decline"): _handle_handoff_decline,
     ("POST", "/handoff/withdraw"): _handle_handoff_withdraw,
+    # The basis check and the commit under a basis. Registered HERE so they
+    # ride the one dispatcher seam. The check initiates no write and serves
+    # during a migration drain; the commit is a version-bumping write and is
+    # refused then. Python-only: the Node backend answers them 404.
+    _BASIS_CHECK_ROUTE: _handle_basis_check,
+    _BASIS_COMMIT_ROUTE: _handle_basis_commit,
     # WV plan Unit 3 — workspace-checkpoint endpoints. Registered HERE so they
     # ride the central verify_bearer + verify_host seam like every route. The
     # POST threads a watchdog abort Event into the service's abort_guard (the
@@ -8431,6 +8886,9 @@ _MIGRATION_REJECTED_ROUTES: set[tuple[str, str]] = {
     # session.commit_all is the batch OCC write — same strand hazard as
     # /session/commit, multiplied across the write-set. Reject it draining.
     ("POST", "/session/commit_all"),
+    # The commit under a basis bumps the target's version: the same strand
+    # hazard as /hooks/post-edit-cas. /basis/check writes nothing and serves.
+    _BASIS_COMMIT_ROUTE,
     # WV Unit 5: the restore registration is a version-bumping write
     # initiation (its commit_all rides the same strand hazard). The restore
     # PROGRESS routes (/workspace/restore/status, /workspace/restore/member)
@@ -8462,6 +8920,8 @@ _ENDPOINT_COUNTER_NAMES: dict[tuple[str, str], str] = {
     ("POST", "/handoff/accept"): "handoff_accept_total",
     ("POST", "/handoff/decline"): "handoff_decline_total",
     ("POST", "/handoff/withdraw"): "handoff_withdraw_total",
+    _BASIS_CHECK_ROUTE: "basis_check_total",
+    _BASIS_COMMIT_ROUTE: "basis_commit_total",
     # /admin/prepare-for-migration intentionally not counted — it
     # initiates shutdown, so counting it would never be observable via
     # subsequent /status calls (coordinator is already down).
@@ -8635,6 +9095,8 @@ _CALLER_GATE_DEGRADED_RESPONSE: dict[tuple[str, str], dict] = {
     ("POST", "/handoff/accept"): _HANDOFF_ACCEPT_DEGRADED_RESPONSE,
     ("POST", "/handoff/decline"): _HANDOFF_DECLINE_DEGRADED_RESPONSE,
     ("POST", "/handoff/withdraw"): _HANDOFF_WITHDRAW_DEGRADED_RESPONSE,
+    _BASIS_CHECK_ROUTE: _BASIS_CHECK_DEGRADED_RESPONSE,
+    _BASIS_COMMIT_ROUTE: _BASIS_COMMIT_DEGRADED_RESPONSE,
 }
 """What a route answers when its caller-principal gate cannot decide within the
 handler watchdog: exactly what its handler passes ``_run_or_degrade`` for a
@@ -8834,8 +9296,20 @@ def _run_or_degrade(
 
 
 _EFFECT_FENCE_ROUTE: tuple[str, str] = ("POST", "/hooks/effect-fence")
-"""The one route whose work body owns its own exception arm (a hold, see
-:data:`_EFFECT_FENCE_INTERNAL_HOLD_RESPONSE`), keyed as ``_ROUTES`` keys it."""
+"""The effect fence's route, keyed as ``_ROUTES`` keys it: its work body owns
+its own exception arm (a hold, see :data:`_EFFECT_FENCE_INTERNAL_HOLD_RESPONSE`)
+and counts it as a hold, so its gate does too."""
+
+_INTERNAL_ERROR_RESPONSE: dict[tuple[str, str], dict] = {
+    _EFFECT_FENCE_ROUTE: _EFFECT_FENCE_INTERNAL_HOLD_RESPONSE,
+    _BASIS_CHECK_ROUTE: _BASIS_CHECK_INTERNAL_HOLD_RESPONSE,
+    _BASIS_COMMIT_ROUTE: _BASIS_COMMIT_INTERNAL_HOLD_RESPONSE,
+}
+"""The routes whose answer to a raise is a hold rather than the
+``{"ok": false, "reason": "internal: <Type>"}`` envelope: a client branching
+on ``verdict`` or ``answer`` must read an answer, and on these routes only a
+hold is safe. The commit's is the outcome-unknown hold, since the raise may
+follow a win."""
 
 
 def _answer_handler_error(
@@ -8856,20 +9330,24 @@ def _answer_handler_error(
     available" and degrades, so a raise the gate let reach the dispatcher's
     500 would have a degrade-mode ``CoherentVolume`` write with no grant and
     no peer invalidation, while the same raise inside the work body answered
-    the typed 200 it raises ``StaleView`` on. The effect fence is the one
-    route whose body catches inside itself and answers a HOLD rather than
-    this shape (a client branching on ``verdict`` must read an answer), so on
-    that route the gate answers, and counts, the same hold the body would.
-    Nothing else is counted: a raise is not a watchdog timeout, and a gate
-    that decided nothing is neither an admission nor a refusal.
+    the typed 200 it raises ``StaleView`` on. The routes in
+    :data:`_INTERNAL_ERROR_RESPONSE` answer their own HOLD rather than this
+    shape (a client branching on ``verdict`` or ``answer`` must read an
+    answer), from the gate and the work body alike; the effect fence's body
+    catches inside itself and counts its hold, so on that route the gate
+    counts it too. Nothing else is counted: a raise is not a watchdog
+    timeout, and a gate that decided nothing is neither an admission nor a
+    refusal.
 
     ``failed`` names what raised, for the log. Only the exception's own text
     reaches the log and only its TYPE reaches the body; the lookup's operands
     (a presented principal) are in neither."""
     logger.exception("%s failed: %s", failed, exc)
-    if req._route_key == _EFFECT_FENCE_ROUTE:
-        coordinator.increment_effect_fence_hold()
-        req._json(200, dict(_EFFECT_FENCE_INTERNAL_HOLD_RESPONSE))
+    internal = _INTERNAL_ERROR_RESPONSE.get(req._route_key)
+    if internal is not None:
+        if req._route_key == _EFFECT_FENCE_ROUTE:
+            coordinator.increment_effect_fence_hold()
+        req._json(200, dict(internal))
         return
     req._json(200, {"ok": False, "reason": f"{HANDLER_FAILURE_REASON_PREFIX}{type(exc).__name__}"})
 

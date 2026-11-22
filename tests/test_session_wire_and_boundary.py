@@ -1005,6 +1005,73 @@ def test_handoff_route_without_bearer_is_401(coordinator, route: str) -> None:
 
 
 # ----------------------------------------------------------------------
+# The basis check and the commit under a basis
+# ----------------------------------------------------------------------
+
+#: FROZEN duplicate of the two basis routes: each one's attempt counter, and
+#: whether a migration drain refuses it (the commit bumps a version; the check
+#: writes nothing).
+_BASIS_ROUTES = {
+    "/basis/check": ("basis_check_total", False),
+    "/basis/commit": ("basis_commit_total", True),
+}
+
+
+def _basis_body(route: str) -> dict:
+    """A well-formed request naming ``plan.md``, which nothing has read: the
+    route answers it (a hold) without the request moving anything."""
+    member = {"path": "plan.md", "version": 1}
+    body: dict = {"session_id": _sid("basis-route"), "basis": [member]}
+    if route == "/basis/commit":
+        body |= {"target": member, "content_hash": hashlib.sha256(b"basis").hexdigest()}
+    return body
+
+
+@pytest.mark.parametrize("route", sorted(_BASIS_ROUTES))
+def test_basis_route_is_registered_counted_and_refused_draining_only_when_it_writes(
+    route: str, coordinator, client: _Client
+) -> None:
+    """Each basis route is registered in the central table (so the bearer and
+    Host seam applies) and counted once per request it serves, in BOTH counter
+    registrations -- the bump itself is asserted. During a migration drain the
+    commit answers 503, as every write initiation does, and the check is still
+    answered."""
+    counter, refused_draining = _BASIS_ROUTES[route]
+    assert ("POST", route) in _ROUTES
+    assert _ENDPOINT_COUNTER_NAMES[("POST", route)] == counter
+    assert (("POST", route) in _MIGRATION_REJECTED_ROUTES) is refused_draining
+    before = coordinator.endpoint_counters_snapshot()[counter]
+
+    status, answer = client.post(route, _basis_body(route))
+    assert status == 200 and answer["answer"] == "hold", answer
+    assert coordinator.endpoint_counters_snapshot()[counter] == before + 1
+
+    coordinator._migration_draining = True
+    try:
+        status, answer = client.post(route, _basis_body(route))
+    finally:
+        coordinator._migration_draining = False
+    if refused_draining:
+        assert status == 503 and "draining" in answer["error"], answer
+        assert coordinator.endpoint_counters_snapshot()[counter] == before + 1
+    else:
+        assert status == 200 and answer["answer"] == "hold", answer
+        assert coordinator.endpoint_counters_snapshot()[counter] == before + 2
+
+
+@pytest.mark.parametrize("route", sorted(_BASIS_ROUTES))
+def test_basis_route_without_bearer_is_401(coordinator, route: str) -> None:
+    url = f"http://127.0.0.1:{coordinator.port}{route}"
+    req = urlrequest.Request(
+        url, data=json.dumps(_basis_body(route)).encode(), method="POST",
+        headers={"Host": "127.0.0.1", "Content-Type": "application/json"},
+    )
+    with pytest.raises(urlerror.HTTPError) as err:
+        urlrequest.urlopen(req, timeout=5)
+    assert err.value.code == 401
+
+
+# ----------------------------------------------------------------------
 # Transfer-record eviction on the sweep (#185)
 # ----------------------------------------------------------------------
 
