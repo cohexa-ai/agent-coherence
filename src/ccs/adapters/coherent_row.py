@@ -556,7 +556,7 @@ class CoherentRow:
         _value, version = row
         if not _is_usable_version(version) or version == expected_version:
             return None
-        return str(int(version))  # rendered exactly as read() renders it
+        return str(expected_version)  # deliberate red: report the comparand, not the read-back
 
     def _current_version_or_wedged(self, artifact_ref: str) -> int:
         row = self._fetch_row(artifact_ref)
