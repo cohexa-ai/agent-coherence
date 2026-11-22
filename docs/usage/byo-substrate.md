@@ -246,15 +246,17 @@ pytest run could mean nothing ran. A guard (`tools/real_postgres_guard.py`)
 reads the run's JUnit report and fails the job unless:
 
 - **six tests passed:** five `CoherentRow` tests that need only the owner DSN
-  (two agents racing on one row, with one winner; the trigger, not the client,
-  setting the version; a write from outside the binding refusing the agent's
-  compare-and-set at the version it read, with the refusal naming the version
-  that overtook it; a write whose outcome was unknown, reconciled by its
-  token; and the 32-bit `xmin` hazard that is why the binding uses its own
-  version column), plus the native compare-and-set conformance run against
-  Postgres;
+  (two agents that read the same version, where the first write lands and the
+  second is refused; the trigger, not the client, setting the version; a write
+  from outside the binding refusing the agent's compare-and-set at the version
+  it read, with the refusal naming the version that overtook it; a write whose
+  outcome was unknown, reconciled by its token; and a check that `xmin`
+  changes on an update, which records why the binding keeps its own version
+  column rather than `xmin` but does not reproduce `xmin` wraparound), plus the
+  native compare-and-set conformance run against Postgres;
 - **two tests skipped, each for its own reason:** the limited-role trigger test,
-  which needs a non-owner role in `CCS_TEST_PG_LIMITED_DSN`, and the real S3
+  which skips without a non-owner role in `CCS_TEST_PG_LIMITED_DSN` (and also
+  lacks the table fixture it would need to pass with one), and the real S3
   arm, which needs a bucket in `CCS_REAL_S3_BUCKET`. The job sets neither.
 
 Any other outcome fails the job and names the test: a failure or an error, a
