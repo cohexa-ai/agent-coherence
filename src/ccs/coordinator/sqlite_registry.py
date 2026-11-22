@@ -120,6 +120,7 @@ try:
 except ImportError:  # pragma: no cover - Windows has no flock
     fcntl = None  # type: ignore[assignment]
 
+from ccs.core.basis import canonical_registration
 from ccs.core.exceptions import (
     CROSS_RUNTIME_SCHEMA_REASON,
     REGISTRY_META_INCOMPLETE_REASON,
@@ -177,6 +178,9 @@ from .registry_protocol import (
     HANDOFF_TRIGGER,
     RECLAIM_TRIGGERS,  # noqa: F401 — re-exported; see the parity test
     SWEEP_RECLAIM_TRIGGERS,
+    BasisCasResult,
+    BasisMoved,
+    BasisRow,
     CaptureResult,
     CasResult,
     CheckpointMember,
@@ -190,10 +194,13 @@ from .registry_protocol import (
     TransferRequest,
     UncoverableRun,
     acquire_by_deadline,
+    basis_comparands,
     decide_transfer_grant,
     forget_refusal,
+    moved_basis_ids,
     note_guard_won,
     refusal_with_generation_pair,
+    require_basis_bindable,
     require_storable_transfer_status,
     transfer_record_live,
 )
@@ -650,6 +657,14 @@ _NAMES_PER_QUERY = 500
 def _in_clause(values: Sequence[object]) -> str:
     """``IN (?, ?, ...)`` placeholders for ``values``."""
     return f"IN ({', '.join('?' for _ in values)})"
+
+
+def row_registration(artifact_id: UUID) -> str:
+    """The registration a basis records for a row of this store: its id in
+    canonical dashed form. The coordinator mints a fresh id for every row it
+    registers, so a path deleted and registered again carries a new one. A
+    caller holding a row id reads its registration here, with no query."""
+    return str(artifact_id)
 
 
 @dataclass
@@ -1313,6 +1328,21 @@ class _ArtifactRow:
 
     artifact: Artifact
     last_writer_id: Optional[UUID]
+
+
+@dataclass(frozen=True)
+class _CasCall:
+    """One compare-and-swap's arguments, carried from the entry point that
+    opened the transaction into the body that runs inside it."""
+
+    artifact_id: UUID
+    agent_id: UUID
+    expected_version: int
+    content_hash: str
+    size_tokens: int | None
+    content: bytes | str | None
+    tick: int
+    trigger: str
 
 
 class SqliteArtifactRegistry:
@@ -3419,6 +3449,28 @@ class SqliteArtifactRegistry:
         with self._lock:
             rows = self._conn.execute("SELECT id FROM artifacts").fetchall()
         return [UUID(hex=r[0]) for r in rows]
+
+    def basis_rows(
+        self, registrations: Iterable[str | UUID], names: Iterable[str]
+    ) -> list[BasisRow]:
+        """See :meth:`RegistryBase.basis_rows`: one ``SELECT`` under the lock,
+        no transaction, matching a registration against the row id it names
+        (:func:`row_registration`) and a name exactly. Serves a read-only
+        handle too."""
+        row_ids = {UUID(canonical_registration(r)).hex for r in registrations}
+        wanted_names = set(names)
+        require_basis_bindable(len(row_ids) + len(wanted_names))
+        with self._lock:
+            rows = self._select_basis_rows(sorted(row_ids), sorted(wanted_names))
+        return [
+            BasisRow(
+                artifact_id=UUID(hex=row_id),
+                name=name,
+                version=version,
+                registration=row_registration(UUID(hex=row_id)),
+            )
+            for row_id, name, version in rows
+        ]
 
     def get_artifact(self, artifact_id: UUID) -> Optional[Artifact]:
         """Return artifact metadata if present."""
@@ -5706,237 +5758,339 @@ class SqliteArtifactRegistry:
         therefore gets NO durable capture — retention is inert for that workload
         by design.
         """
+        call = _CasCall(
+            artifact_id=artifact_id,
+            agent_id=agent_id,
+            expected_version=expected_version,
+            content_hash=content_hash,
+            size_tokens=size_tokens,
+            content=content,
+            tick=tick,
+            trigger=trigger,
+        )
         self._guard_writable()
         with self._lock:
-            # Track every _seq increment in this call so the outer
-            # BaseException handler can roll them ALL back if COMMIT (or any
-            # later step) fails — mirrors set_agent_state's COR-02 contract,
-            # generalized to the multiple emissions one CAS can produce.
-            seq_incremented_count = 0
             self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                version_row = self._conn.execute(
-                    _DECISION_SNAPSHOT_SQL, (agent_id.hex, artifact_id.hex)
-                ).fetchone()
-                if version_row is None:
-                    raise KeyError(f"artifact {artifact_id} not in registry")
-                current, current_size_tokens, owner_gen, read_gen = version_row
-                generation_pair = (read_gen, owner_gen)
+            return self._commit_cas_in_txn(call)
 
-                # 3-outcome discrimination. Each ConflictDetail branch resolves
-                # via _deny (U5 instrumentation; see its docstring for the
-                # count -> COMMIT -> fire ordering); corruption COMMITs a
-                # genuinely read-only txn (corruption is not one of the three
-                # counted reasons).
-                if expected_version > current:
-                    self._conn.execute("COMMIT")
-                    return CasCorruption(current_version=current)
-                if expected_version < current:
-                    return self._deny(
-                        artifact_id,
-                        agent_id,
-                        refusal_with_generation_pair("version_mismatch", current, generation_pair),
-                    )
-                # Version matches. Holder check is the OCC-vs-pessimistic guard;
-                # exclude the committer itself (it is S/I, but be defensive).
-                other_holder = self._conn.execute(
-                    """
-                    SELECT 1 FROM agent_states
-                    WHERE artifact_id = ? AND agent_id != ? AND state IN (?, ?)
-                    LIMIT 1
-                    """,
-                    (
-                        artifact_id.hex,
-                        agent_id.hex,
-                        MESIState.MODIFIED.name,
-                        MESIState.EXCLUSIVE.name,
-                    ),
-                ).fetchone()
-                if other_holder is not None:
-                    return self._deny(
-                        artifact_id, agent_id, refusal_with_generation_pair("other_holder", current, generation_pair)
-                    )
+    def _commit_cas_in_txn(self, call: _CasCall) -> CasResult:
+        """The compare-and-swap legs and the win, inside the caller's open
+        ``BEGIN IMMEDIATE``.
 
-                # Read-generation fence: reject a committer whose CAPTURED
-                # read-claim was superseded by a sweep reclamation (a reclaimed
-                # M/E holder kept its stale read_generation -- version unchanged,
-                # no other M/E holder, so version-CAS cannot catch it). An ABSENT
-                # read_generation (missing row or NULL) means a plain OCC writer
-                # that never established a fence claim -- version-CAS protects it,
-                # so admit. Strict->; equality admits. Server-side, no signature
-                # change.
-                if read_gen is not None and read_gen < owner_gen:
-                    return self._deny(
-                        artifact_id,
-                        agent_id,
-                        refusal_with_generation_pair("stale_read_generation", current, generation_pair),
-                    )
+        The caller holds ``self._lock`` and has just begun the transaction;
+        this ends it on every path: ``COMMIT`` on a win, on each typed deny
+        (through :meth:`_deny`, which counts it and then fires the conflict
+        callbacks) and on corruption, and ``ROLLBACK`` with the ``_seq``
+        rollback on any raise. The name read for the returned artifact runs
+        after the ``COMMIT``, still under the lock. One body serves
+        :meth:`commit_cas` and :meth:`commit_cas_if_basis`, so the commit a
+        basis admits is exactly the commit ``commit_cas`` makes.
+        """
+        artifact_id, agent_id = call.artifact_id, call.agent_id
+        expected_version, content_hash = call.expected_version, call.content_hash
+        size_tokens, content = call.size_tokens, call.content
+        tick, trigger = call.tick, call.trigger
+        # Track every _seq increment in this call so the outer
+        # BaseException handler can roll them ALL back if COMMIT (or any
+        # later step) fails — mirrors set_agent_state's COR-02 contract,
+        # generalized to the multiple emissions one CAS can produce.
+        seq_incremented_count = 0
+        try:
+            version_row = self._conn.execute(
+                _DECISION_SNAPSHOT_SQL, (agent_id.hex, artifact_id.hex)
+            ).fetchone()
+            if version_row is None:
+                raise KeyError(f"artifact {artifact_id} not in registry")
+            current, current_size_tokens, owner_gen, read_gen = version_row
+            generation_pair = (read_gen, owner_gen)
 
-                # ---- WIN: mutate atomically ----
-                next_version = current + 1
-                # Preserve the persisted size_tokens when the caller passes None
-                # (the cross-process / coordinator-server path always does) —
-                # matches the in-memory registry, where a None arg keeps the
-                # prior value rather than NULLing it. Without this, every
-                # cross-process OCC commit would silently zero size_tokens.
-                resolved_size_tokens = (
-                    current_size_tokens if size_tokens is None else size_tokens
+            # 3-outcome discrimination. Each ConflictDetail branch resolves
+            # via _deny (U5 instrumentation; see its docstring for the
+            # count -> COMMIT -> fire ordering); corruption COMMITs a
+            # genuinely read-only txn (corruption is not one of the three
+            # counted reasons).
+            if expected_version > current:
+                self._conn.execute("COMMIT")
+                return CasCorruption(current_version=current)
+            if expected_version < current:
+                return self._deny(
+                    artifact_id,
+                    agent_id,
+                    refusal_with_generation_pair("version_mismatch", current, generation_pair),
                 )
+            # Version matches. Holder check is the OCC-vs-pessimistic guard;
+            # exclude the committer itself (it is S/I, but be defensive).
+            other_holder = self._conn.execute(
+                """
+                SELECT 1 FROM agent_states
+                WHERE artifact_id = ? AND agent_id != ? AND state IN (?, ?)
+                LIMIT 1
+                """,
+                (
+                    artifact_id.hex,
+                    agent_id.hex,
+                    MESIState.MODIFIED.name,
+                    MESIState.EXCLUSIVE.name,
+                ),
+            ).fetchone()
+            if other_holder is not None:
+                return self._deny(
+                    artifact_id, agent_id, refusal_with_generation_pair("other_holder", current, generation_pair)
+                )
+
+            # Read-generation fence: reject a committer whose CAPTURED
+            # read-claim was superseded by a sweep reclamation (a reclaimed
+            # M/E holder kept its stale read_generation -- version unchanged,
+            # no other M/E holder, so version-CAS cannot catch it). An ABSENT
+            # read_generation (missing row or NULL) means a plain OCC writer
+            # that never established a fence claim -- version-CAS protects it,
+            # so admit. Strict->; equality admits. Server-side, no signature
+            # change.
+            if read_gen is not None and read_gen < owner_gen:
+                return self._deny(
+                    artifact_id,
+                    agent_id,
+                    refusal_with_generation_pair("stale_read_generation", current, generation_pair),
+                )
+
+            # ---- WIN: mutate atomically ----
+            next_version = current + 1
+            # Preserve the persisted size_tokens when the caller passes None
+            # (the cross-process / coordinator-server path always does) —
+            # matches the in-memory registry, where a None arg keeps the
+            # prior value rather than NULLing it. Without this, every
+            # cross-process OCC commit would silently zero size_tokens.
+            resolved_size_tokens = (
+                current_size_tokens if size_tokens is None else size_tokens
+            )
+            self._conn.execute(
+                """
+                UPDATE artifacts
+                SET version = ?, content_hash = ?, size_tokens = ?,
+                    last_writer_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    next_version,
+                    content_hash,
+                    resolved_size_tokens,
+                    agent_id.hex,
+                    time.time(),
+                    artifact_id.hex,
+                ),
+            )
+
+            # Invalidate every non-INVALID peer (inlined; cannot call
+            # set_agent_state). Read the peers first so we can both emit a
+            # per-peer state_log entry and return the id list for the
+            # service's InvalidationSignal construction.
+            peer_rows = self._conn.execute(
+                """
+                SELECT agent_id, state, granted_at_tick FROM agent_states
+                WHERE artifact_id = ? AND agent_id != ? AND state != ?
+                """,
+                (artifact_id.hex, agent_id.hex, MESIState.INVALID.name),
+            ).fetchall()
+            invalidated: list[UUID] = []
+            for peer_hex, peer_state_name, peer_granted in peer_rows:
+                peer_from = MESIState[peer_state_name]
+                # A peer leaving M∪E drops its granted_at_tick slot
+                # (set_agent_state's "prev_in_me and not new_in_me" branch).
+                peer_in_me = peer_from in _M_OR_E_STATES
+                new_granted = None if peer_in_me else peer_granted
                 self._conn.execute(
                     """
-                    UPDATE artifacts
-                    SET version = ?, content_hash = ?, size_tokens = ?,
-                        last_writer_id = ?, updated_at = ?
-                    WHERE id = ?
+                    UPDATE agent_states
+                    SET state = ?, granted_at_tick = ?
+                    WHERE artifact_id = ? AND agent_id = ?
                     """,
                     (
-                        next_version,
-                        content_hash,
-                        resolved_size_tokens,
-                        agent_id.hex,
-                        time.time(),
+                        MESIState.INVALID.name,
+                        new_granted,
                         artifact_id.hex,
+                        peer_hex,
                     ),
                 )
-
-                # Invalidate every non-INVALID peer (inlined; cannot call
-                # set_agent_state). Read the peers first so we can both emit a
-                # per-peer state_log entry and return the id list for the
-                # service's InvalidationSignal construction.
-                peer_rows = self._conn.execute(
-                    """
-                    SELECT agent_id, state, granted_at_tick FROM agent_states
-                    WHERE artifact_id = ? AND agent_id != ? AND state != ?
-                    """,
-                    (artifact_id.hex, agent_id.hex, MESIState.INVALID.name),
-                ).fetchall()
-                invalidated: list[UUID] = []
-                for peer_hex, peer_state_name, peer_granted in peer_rows:
-                    peer_from = MESIState[peer_state_name]
-                    # A peer leaving M∪E drops its granted_at_tick slot
-                    # (set_agent_state's "prev_in_me and not new_in_me" branch).
-                    peer_in_me = peer_from in _M_OR_E_STATES
-                    new_granted = None if peer_in_me else peer_granted
-                    self._conn.execute(
-                        """
-                        UPDATE agent_states
-                        SET state = ?, granted_at_tick = ?
-                        WHERE artifact_id = ? AND agent_id = ?
-                        """,
-                        (
-                            MESIState.INVALID.name,
-                            new_granted,
-                            artifact_id.hex,
-                            peer_hex,
-                        ),
-                    )
-                    seq_incremented_count += self._emit_state_log(
-                        artifact_id=artifact_id,
-                        agent_id=UUID(hex=peer_hex),
-                        from_state=peer_from,
-                        to_state=MESIState.INVALID,
-                        trigger=trigger,
-                        tick=tick,
-                        version=next_version,
-                        content_hash=None,
-                    )
-                    invalidated.append(UUID(hex=peer_hex))
-
-                # Transition the committer S/I → SHARED. An OCC writer holds NO
-                # grant (it is optimistic — it never acquired EXCLUSIVE), so the
-                # honest end-state is SHARED, NOT MODIFIED. A sticky MODIFIED
-                # grant would make the SAME agent's next commit_cas/write_cas hit
-                # the service D4 precondition (which rejects M/E callers) and hard-
-                # fail; ending SHARED keeps OCC writes repeatable. SHARED is not
-                # in M∪E, so this is NOT an acquire: do NOT set granted_at_tick to
-                # ``tick`` and do NOT clear the reclaim slot (mirror
-                # set_agent_state's non-M/E branch — preserve prior granted_at,
-                # leave reclaim columns untouched). A fresh S/I committer holds no
-                # grant slot, so the preserved value is None either way.
-                committer_row = self._conn.execute(
-                    "SELECT state, granted_at_tick FROM agent_states "
-                    "WHERE artifact_id = ? AND agent_id = ?",
-                    (artifact_id.hex, agent_id.hex),
-                ).fetchone()
-                committer_from = (
-                    MESIState[committer_row[0]] if committer_row else MESIState.INVALID
-                )
-                # SB-10 R6/R7 (KTD4 first layer): the WIN advances the WRITER's
-                # last_observed_version to next_version atomically in this txn
-                # — it produced (and therefore observed) the new version's
-                # bytes. Peers going INVALID above keep their prior value.
-                if committer_row is None:
-                    self._conn.execute(
-                        """
-                        INSERT INTO agent_states (artifact_id, agent_id, state, granted_at_tick,
-                                                  last_reclaim_trigger, last_reclaim_tick,
-                                                  last_observed_version)
-                        VALUES (?, ?, ?, NULL, NULL, NULL, ?)
-                        """,
-                        (artifact_id.hex, agent_id.hex, MESIState.SHARED.name, next_version),
-                    )
-                else:
-                    # Preserve granted_at_tick (None for an S/I committer); the
-                    # reclaim columns are NOT touched — exactly set_agent_state's
-                    # "neither new nor prev in M∪E" path.
-                    prior_granted_at = committer_row[1]
-                    self._conn.execute(
-                        """
-                        UPDATE agent_states
-                        SET state = ?, granted_at_tick = ?, last_observed_version = ?
-                        WHERE artifact_id = ? AND agent_id = ?
-                        """,
-                        (MESIState.SHARED.name, prior_granted_at, next_version,
-                         artifact_id.hex, agent_id.hex),
-                    )
                 seq_incremented_count += self._emit_state_log(
                     artifact_id=artifact_id,
-                    agent_id=agent_id,
-                    from_state=committer_from,
-                    to_state=MESIState.SHARED,
+                    agent_id=UUID(hex=peer_hex),
+                    from_state=peer_from,
+                    to_state=MESIState.INVALID,
                     trigger=trigger,
                     tick=tick,
                     version=next_version,
-                    content_hash=content_hash,
+                    content_hash=None,
                 )
+                invalidated.append(UUID(hex=peer_hex))
 
-                # Durable capture of the WINNING body under next_version, INSIDE
-                # this txn (crash-atomic with the version bump). content=None
-                # SKIPS capture (the in-memory parity fix): an unsupplied body
-                # leaves next_version with no snapshot rather than poisoning it
-                # with the stale OLD body. The non-OSError escape window (binding
-                # a large bytes/str into the INSERT) is covered by the outer
-                # BaseException ROLLBACK below.
-                if self._retain_versions and content is not None:
-                    self._capture_version_sql(artifact_id, next_version, content)
-
-                self._conn.execute("COMMIT")
-                # COMMIT succeeded — _seq durably persisted; suppress rollback.
-                seq_incremented_count = 0
-            except BaseException:
-                # BaseException (not Exception) so KeyboardInterrupt/SystemExit
-                # mid-transaction still ROLLBACK before propagating — the same
-                # idiom every mutating method here uses.
-                if self._conn.in_transaction:
-                    # A deny branch above may have already COMMITted before
-                    # this raise (e.g. KeyboardInterrupt inside an observer
-                    # callback); a ROLLBACK with no open txn would itself
-                    # raise and shadow the real exception.
-                    self._conn.execute("ROLLBACK")
-                # Roll the in-memory _seq back to match the rolled-back DB so
-                # the next successful emission does not leave a phantom gap.
-                if seq_incremented_count:
-                    self._seq -= seq_incremented_count
-                raise
-
-            updated = Artifact(
-                id=artifact_id,
-                name=self._artifact_name(artifact_id),
+            # Transition the committer S/I → SHARED. An OCC writer holds NO
+            # grant (it is optimistic — it never acquired EXCLUSIVE), so the
+            # honest end-state is SHARED, NOT MODIFIED. A sticky MODIFIED
+            # grant would make the SAME agent's next commit_cas/write_cas hit
+            # the service D4 precondition (which rejects M/E callers) and hard-
+            # fail; ending SHARED keeps OCC writes repeatable. SHARED is not
+            # in M∪E, so this is NOT an acquire: do NOT set granted_at_tick to
+            # ``tick`` and do NOT clear the reclaim slot (mirror
+            # set_agent_state's non-M/E branch — preserve prior granted_at,
+            # leave reclaim columns untouched). A fresh S/I committer holds no
+            # grant slot, so the preserved value is None either way.
+            committer_row = self._conn.execute(
+                "SELECT state, granted_at_tick FROM agent_states "
+                "WHERE artifact_id = ? AND agent_id = ?",
+                (artifact_id.hex, agent_id.hex),
+            ).fetchone()
+            committer_from = (
+                MESIState[committer_row[0]] if committer_row else MESIState.INVALID
+            )
+            # SB-10 R6/R7 (KTD4 first layer): the WIN advances the WRITER's
+            # last_observed_version to next_version atomically in this txn
+            # — it produced (and therefore observed) the new version's
+            # bytes. Peers going INVALID above keep their prior value.
+            if committer_row is None:
+                self._conn.execute(
+                    """
+                    INSERT INTO agent_states (artifact_id, agent_id, state, granted_at_tick,
+                                              last_reclaim_trigger, last_reclaim_tick,
+                                              last_observed_version)
+                    VALUES (?, ?, ?, NULL, NULL, NULL, ?)
+                    """,
+                    (artifact_id.hex, agent_id.hex, MESIState.SHARED.name, next_version),
+                )
+            else:
+                # Preserve granted_at_tick (None for an S/I committer); the
+                # reclaim columns are NOT touched — exactly set_agent_state's
+                # "neither new nor prev in M∪E" path.
+                prior_granted_at = committer_row[1]
+                self._conn.execute(
+                    """
+                    UPDATE agent_states
+                    SET state = ?, granted_at_tick = ?, last_observed_version = ?
+                    WHERE artifact_id = ? AND agent_id = ?
+                    """,
+                    (MESIState.SHARED.name, prior_granted_at, next_version,
+                     artifact_id.hex, agent_id.hex),
+                )
+            seq_incremented_count += self._emit_state_log(
+                artifact_id=artifact_id,
+                agent_id=agent_id,
+                from_state=committer_from,
+                to_state=MESIState.SHARED,
+                trigger=trigger,
+                tick=tick,
                 version=next_version,
                 content_hash=content_hash,
-                size_tokens=resolved_size_tokens,
             )
-            return updated, invalidated
+
+            # Durable capture of the WINNING body under next_version, INSIDE
+            # this txn (crash-atomic with the version bump). content=None
+            # SKIPS capture (the in-memory parity fix): an unsupplied body
+            # leaves next_version with no snapshot rather than poisoning it
+            # with the stale OLD body. The non-OSError escape window (binding
+            # a large bytes/str into the INSERT) is covered by the outer
+            # BaseException ROLLBACK below.
+            if self._retain_versions and content is not None:
+                self._capture_version_sql(artifact_id, next_version, content)
+
+            self._conn.execute("COMMIT")
+            # COMMIT succeeded — _seq durably persisted; suppress rollback.
+            seq_incremented_count = 0
+        except BaseException:
+            # BaseException (not Exception) so KeyboardInterrupt/SystemExit
+            # mid-transaction still ROLLBACK before propagating — the same
+            # idiom every mutating method here uses.
+            if self._conn.in_transaction:
+                # A deny branch above may have already COMMITted before
+                # this raise (e.g. KeyboardInterrupt inside an observer
+                # callback); a ROLLBACK with no open txn would itself
+                # raise and shadow the real exception.
+                self._conn.execute("ROLLBACK")
+            # Roll the in-memory _seq back to match the rolled-back DB so
+            # the next successful emission does not leave a phantom gap.
+            if seq_incremented_count:
+                self._seq -= seq_incremented_count
+            raise
+
+        updated = Artifact(
+            id=artifact_id,
+            name=self._artifact_name(artifact_id),
+            version=next_version,
+            content_hash=content_hash,
+            size_tokens=resolved_size_tokens,
+        )
+        return updated, invalidated
+
+    def commit_cas_if_basis(
+        self,
+        basis: Mapping[UUID, int],
+        artifact_id: UUID,
+        agent_id: UUID,
+        *,
+        expected_version: int,
+        content_hash: str,
+        size_tokens: int | None = None,
+        content: bytes | str | None = None,
+        tick: int = 0,
+        trigger: str = "commit_cas",
+    ) -> BasisCasResult:
+        """See :meth:`RegistryBase.commit_cas_if_basis`.
+
+        One ``BEGIN IMMEDIATE`` holds the store's write lock from the basis
+        compare (:meth:`_compare_basis`) through the target's compare-and-swap,
+        so a writer on another handle to this store cannot commit between
+        them; the registry lock alone would hold off only this handle's
+        writers. A moved basis ends the transaction with an explicit
+        ``ROLLBACK`` before any compare-and-swap leg, so nothing is written or
+        counted and no conflict callback fires; an unchanged one goes to the
+        body :meth:`commit_cas` runs, which ends the transaction itself."""
+        comparands = basis_comparands(basis, artifact_id, expected_version)
+        call = _CasCall(
+            artifact_id=artifact_id,
+            agent_id=agent_id,
+            expected_version=expected_version,
+            content_hash=content_hash,
+            size_tokens=size_tokens,
+            content=content,
+            tick=tick,
+            trigger=trigger,
+        )
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                moved = self._compare_basis(comparands)
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            if moved:
+                self._conn.execute("ROLLBACK")
+                return BasisMoved(moved=moved)
+            return self._commit_cas_in_txn(call)
+
+    def _compare_basis(self, comparands: Mapping[UUID, int]) -> dict[UUID, int | None]:
+        """The basis compare step, inside the caller's open transaction: every
+        comparand whose current version is not the expected one, ``None`` for
+        one with no row. Read by the statement :meth:`basis_rows` runs."""
+        rows = self._select_basis_rows([artifact_id.hex for artifact_id in comparands], [])
+        current = {UUID(hex=row_id): version for row_id, _name, version in rows}
+        return moved_basis_ids(comparands, current)
+
+    def _select_basis_rows(
+        self, row_ids: Sequence[str], names: Sequence[str]
+    ) -> list[tuple[str, str, int]]:
+        """The one statement a basis is read with: ``(id, name, version)`` of
+        every row whose id (hex) or exact name is listed, each row once. The
+        caller holds the lock and has kept the lists within the statement cap."""
+        clauses = []
+        if row_ids:
+            clauses.append(f"id {_in_clause(row_ids)}")
+        if names:
+            clauses.append(f"name {_in_clause(names)}")
+        if not clauses:
+            return []
+        return self._conn.execute(
+            f"SELECT id, name, version FROM artifacts WHERE {' OR '.join(clauses)}",
+            (*row_ids, *names),
+        ).fetchall()
 
     def commit_all(
         self,

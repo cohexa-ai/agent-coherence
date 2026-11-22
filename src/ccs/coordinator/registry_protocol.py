@@ -101,6 +101,94 @@ MultiCasResult: TypeAlias = "MultiCommitResult | MultiCommitConflict | CasCorrup
 # {artifact_id: version}; a read_set with an unknown id = VersionedReadRejection,
 # NO pins inserted. Neither is raised by the registry.
 CaptureResult: TypeAlias = "dict[UUID, int] | VersionedReadRejection"
+# A commit under a basis: exactly a CasResult when every basis id (the target's
+# included) is unchanged, else BasisMoved and nothing written. Its own alias, so
+# commit_cas's result type does not widen for callers that never pass a basis.
+BasisCasResult: TypeAlias = (
+    "tuple[Artifact, list[UUID]] | ConflictDetail | CasCorruption | BasisMoved"
+)
+
+
+# ---------------------------------------------------------------------------
+# Basis read and commit: shared by both registries so the compare cannot drift
+# ---------------------------------------------------------------------------
+
+#: The most ids one basis request may name: the variable limit of the oldest
+#: SQLite build the store supports. A basis is read in ONE statement, so every
+#: member is seen at one instant; a request that would not fit is refused whole,
+#: never split across reads. Both registries refuse past it, so a caller sees
+#: the same limit on either.
+BASIS_MAX_BOUND_IDS = 999
+
+
+@dataclass(frozen=True)
+class BasisRow:
+    """One row a basis lookup found: its id, exact name, current version and
+    the registration it carries, a UUID in canonical dashed form that changes
+    whenever a path is registered again."""
+
+    artifact_id: UUID
+    name: str
+    version: int
+    registration: str
+
+
+@dataclass(frozen=True)
+class BasisMoved:
+    """A commit under a basis wrote nothing because an id moved.
+
+    ``moved`` maps every compared id whose current version differs from the
+    expected one, the target's included, to that current version, or to
+    ``None`` when no row carries the id any more. The compare runs before any
+    compare-and-swap leg, so a moved target never reads as ``version_mismatch``
+    and a vanished one never raises ``KeyError``; nothing is counted and no
+    conflict callback fires, because the target's own compare-and-swap never
+    ran."""
+
+    moved: Mapping[UUID, int | None]
+
+
+def require_basis_bindable(count: int) -> None:
+    """Raise ``ValueError`` when a basis request names more ids than one
+    statement may bind (:data:`BASIS_MAX_BOUND_IDS`)."""
+    if count > BASIS_MAX_BOUND_IDS:
+        raise ValueError(
+            f"a basis request names {count} ids; one statement binds at most "
+            f"{BASIS_MAX_BOUND_IDS}"
+        )
+
+
+def basis_comparands(
+    basis: Mapping[UUID, int], artifact_id: UUID, expected_version: int
+) -> dict[UUID, int]:
+    """Every id a commit under ``basis`` compares, with its expected version:
+    the basis and the target at ``expected_version``, listed or not.
+
+    A target listed at another version would give one row two comparands, so
+    that is a malformed call (``ValueError``), as is a request past the
+    statement cap."""
+    if basis.get(artifact_id, expected_version) != expected_version:
+        raise ValueError(
+            f"the target {artifact_id} is listed in the basis at version "
+            f"{basis[artifact_id]} but expected at version {expected_version}"
+        )
+    comparands = {**basis, artifact_id: expected_version}
+    require_basis_bindable(len(comparands))
+    return comparands
+
+
+def moved_basis_ids(
+    comparands: Mapping[UUID, int], current: Mapping[UUID, int]
+) -> dict[UUID, int | None]:
+    """Every comparand whose current version is not the expected one, mapped
+    to that version, or to ``None`` when ``current`` has no row for it. All of
+    them, never only the first: the caller re-derives from every input that
+    moved."""
+    return {
+        artifact_id: current.get(artifact_id)
+        for artifact_id, expected in comparands.items()
+        if current.get(artifact_id) != expected
+    }
 
 
 # Foreign-write detection outcomes (detection-substrate plan R5). Exactly three
@@ -885,6 +973,22 @@ class RegistryBase(Protocol):
     def artifact_ids(self) -> list[UUID]:
         ...
 
+    def basis_rows(
+        self, registrations: "Iterable[str | UUID]", names: "Iterable[str]"
+    ) -> list[BasisRow]:
+        """Return a :class:`BasisRow` for every row whose registration or exact
+        name is asked, each row once, and nothing for one no row carries.
+
+        Lookup only, and read-only: it mints no row, grants nothing, captures
+        no read_generation and counts nothing. One statement on SQLite (no
+        ``BEGIN``) or one lock hold in memory, so every row is read at one
+        instant. A registration is the row's UUID in canonical dashed form: on
+        SQLite the row id, in memory a token minted on every
+        ``register_artifact``, so it changes whenever a path is registered
+        again. Raises ``ValueError`` for a registration that is not a UUID or a
+        request past :data:`BASIS_MAX_BOUND_IDS`."""
+        ...
+
     def bind_caller_principal(
         self, identity: UUID, principal: str, mint_nonce: str
     ) -> tuple[str, str]:
@@ -923,6 +1027,36 @@ class RegistryBase(Protocol):
         tick: int = 0,
         trigger: str = "commit_cas",
     ) -> CasResult:
+        ...
+
+    def commit_cas_if_basis(
+        self,
+        basis: "Mapping[UUID, int]",
+        artifact_id: UUID,
+        agent_id: UUID,
+        *,
+        expected_version: int,
+        content_hash: str,
+        size_tokens: int | None = None,
+        content: bytes | str | None = None,
+        tick: int = 0,
+        trigger: str = "commit_cas",
+    ) -> BasisCasResult:
+        """:meth:`commit_cas` on ``artifact_id``, only while every id in
+        ``basis`` (id -> expected version) is still at its expected version.
+
+        The target's ``expected_version`` is compared with the basis whether or
+        not the target is listed. The compare runs first, inside the same
+        serialized step as the compare-and-swap: on SQLite inside the target's
+        ``BEGIN IMMEDIATE``, so a writer on a second store handle cannot land
+        between them; in memory under the same hold of the registry lock. Any
+        moved or vanished id returns :class:`BasisMoved` naming every one, and
+        nothing is written, counted or reported to the conflict callbacks.
+        Otherwise the result is exactly ``commit_cas``'s; no other basis id is
+        rewritten.
+
+        Raises ``ValueError`` when the basis lists the target at another
+        version, or for a request past :data:`BASIS_MAX_BOUND_IDS`."""
         ...
 
     def commit_all(

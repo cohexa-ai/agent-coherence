@@ -48,6 +48,7 @@ EXPECTED_SHARED_CONSUMERS: frozenset[str] = frozenset({
     "coordinator/test_caller_principal.py",
     "coordinator/test_forget_agent.py",
     "coordinator/test_transfer_record.py",
+    "test_basis_registry.py",
     "test_conflict_instrumentation.py",
     "test_regrant_clears_transient.py",
 })
