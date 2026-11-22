@@ -527,6 +527,9 @@ def ensure_coordinator_handle(
                 shutdown_done=threading.Event(),
                 bound_marker=bound_marker,
             )
+            # A stop the coordinator starts itself (prepare-for-migration)
+            # runs this same sequence, so it frees the lock too (#510).
+            coordinator.install_shutdown_sequence(partial(_shutdown_sequence, entry))
             _SPAWNED_REGISTRY[resolved_key] = entry
             _start_background_threads(entry, cfg)
             # G2 fix: self-probe with generous spawn-side budget before

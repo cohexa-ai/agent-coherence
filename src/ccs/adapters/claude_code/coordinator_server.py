@@ -1241,6 +1241,9 @@ class CoordinatorHTTPServer:
         self._started_at = time.monotonic()
         self._last_request_at = self._started_at
         self._shutting_down = False
+        # The owner's way to stop this coordinator, when it has one: see
+        # install_shutdown_sequence.
+        self._shutdown_sequence: Callable[[], object] | None = None
         # ADV-001 (fix): "migration draining" is a halfway state between
         # serving and shutting_down. While true, new pre-edit requests are
         # rejected (would mint an EXCLUSIVE that the agent can never
@@ -1632,6 +1635,26 @@ class CoordinatorHTTPServer:
                 return
             self._serve_loop_committed = True
         self._server.serve_forever(poll_interval=SERVE_POLL_INTERVAL_SEC)
+
+    def install_shutdown_sequence(self, sequence: Callable[[], object]) -> None:
+        """Have :meth:`request_shutdown` run ``sequence``, the owner's own
+        stop, rather than :meth:`shutdown` alone.
+
+        A coordinator the lifecycle spawned is stopped by the lifecycle's
+        sequence, which also takes the port out of ``server.pid``, frees the
+        workspace lock and lets a detached worker exit. :meth:`shutdown` alone
+        closes the port and leaves all three, so the worker outlives it holding
+        the lock and no new coordinator can start (#510)."""
+        self._shutdown_sequence = sequence
+
+    def request_shutdown(self) -> None:
+        """Stop this coordinator the way its owner stops it: the installed
+        sequence when there is one, else :meth:`shutdown`."""
+        sequence = self._shutdown_sequence
+        if sequence is None:
+            self.shutdown()
+        else:
+            sequence()
 
     def shutdown(self) -> None:
         """Stop the server, drain in-flight handlers, close storage.
@@ -8146,8 +8169,10 @@ def _handle_prepare_for_migration(req: _RequestProtocol, coordinator: Coordinato
        MODIFIED or EXCLUSIVE state — these are orphaned grants from
        sessions that pre-edited but never post-edited (already broken).
        Invalidate each so the new backend doesn't inherit them.
-    4. Schedule ``coordinator.shutdown()`` ~100ms later (kernel send
-       buffer flush window for the response).
+    4. ~100ms later (kernel send buffer flush window for the response),
+       stop the coordinator the way its owner does
+       (:meth:`CoordinatorHTTPServer.request_shutdown`), so a spawned
+       coordinator also frees the workspace lock and its worker exits.
 
     Returns immediately with ``{ok:true, draining:true,
     drain_timeout_ms}``. The CLI polls /status until the coordinator
@@ -8250,7 +8275,9 @@ def _handle_prepare_for_migration(req: _RequestProtocol, coordinator: Coordinato
         # becomes unreachable.
         time.sleep(SHUTDOWN_DELAY_MS / 1000.0)
         try:
-            coordinator.shutdown()
+            # The owner's stop, not shutdown() alone (#510): it also frees
+            # the workspace lock and lets a detached worker exit.
+            coordinator.request_shutdown()
         except Exception:  # pragma: no cover — best-effort cleanup
             logger.exception("scheduled shutdown after prepare-for-migration failed")
 

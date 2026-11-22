@@ -65,9 +65,11 @@ from ccs.adapters.claude_code.coordinator_server import (
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     ensure_coordinator,
+    read_port_from_file,
     stop_coordinator,
 )
 from ccs.adapters.coherent_volume import CoherentVolume
+from ccs.cli import coherence_coordinator
 from ccs.cli._coherence_client import get, post, resolve_endpoint
 from ccs.core.exceptions import StaleView
 from tests.pid_lock_helpers import write_coordinator_pid_file
@@ -475,6 +477,8 @@ _HOOK_MODULE = "ccs.cli.coherence_hook_client"
 _HOOK_TIMEOUT_SEC = 300.0
 #: Far above one coordinator start on a loaded machine.
 _COORDINATOR_START_TIMEOUT_SEC = 60.0
+#: Far above one coordinator stop, its drain and store close included.
+_WORKER_EXIT_TIMEOUT_SEC = 30.0
 _WRITE_STATES = ("EXCLUSIVE", "MODIFIED")
 #: FROZEN copies of today's texts, never built by the code under test, with
 #: their timestamps as normalize_response scrubs them.
@@ -1106,6 +1110,29 @@ def test_an_edit_after_the_coordinator_is_killed_is_denied(workspace: Path, clie
     command = (sys.executable, "-m", "ccs.cli.coherence_coordinator", "--_daemonized", "--root", str(workspace))
     with coordinator_process(workspace, command) as coordinator:
         check_an_edit_after_the_coordinator_is_killed_is_denied(workspace, hook, coordinator)
+
+
+def test_prepare_for_migration_ends_the_detached_worker(workspace: Path) -> None:
+    """Prevents --prepare-for-migration reporting a clean stop while the
+    detached worker lives on, holding the workspace lock and its port line,
+    so that every strict edit is denied with the refusal on and no session
+    start can bring a coordinator up again (#510)."""
+    write_strict_workspace(workspace)
+    command = (sys.executable, "-m", "ccs.cli.coherence_coordinator", "--_daemonized", "--root", str(workspace))
+    with coordinator_process(workspace, command) as worker:
+        assert coherence_coordinator.main(["--root", str(workspace), "--prepare-for-migration", "--quiet"]) == 0
+        try:
+            worker.wait(timeout=_WORKER_EXIT_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            pytest.fail(
+                f"the detached worker is still alive {_WORKER_EXIT_TIMEOUT_SEC:.0f}s after "
+                "prepare-for-migration reported a clean stop"
+            )
+    assert read_port_from_file(workspace / ".coherence" / "server.pid") is None
+    # No coordinator to ask, so the strict edit goes ahead as today.
+    assert_hook_output(PYTHON_CLIENT.edit(workspace, Caller.new()), {})
+    with coordinator_process(workspace, command):
+        PYTHON_CLIENT.take(workspace, Caller.new())
 
 
 @pytest.mark.parametrize("later", HOOK_CLIENTS)

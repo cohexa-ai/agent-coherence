@@ -24,7 +24,13 @@ from typing import Any
 import pytest
 
 from ccs.adapters.claude_code import lifecycle
-from ccs.adapters.claude_code.lifecycle import LifecycleConfig, ensure_coordinator, stop_coordinator
+from ccs.adapters.claude_code.lifecycle import (
+    LifecycleConfig,
+    ensure_coordinator,
+    read_port_from_file,
+    stop_coordinator,
+)
+from ccs.adapters.claude_code.store_check import StoreCheckOutcome, check_store
 from ccs.cli import (
     coherence_coordinator,
     coherence_handoff,
@@ -47,7 +53,11 @@ from ccs.cli._coherence_client import (
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import TlsConfigError, TlsVerificationFailed
 from tests.coherence_link_helpers import plant_link, target_snapshot
-from tests.pid_lock_helpers import hold_coordinator_lock, write_coordinator_pid_file
+from tests.pid_lock_helpers import (
+    hold_coordinator_lock,
+    release_coordinator_lock,
+    write_coordinator_pid_file,
+)
 
 
 @pytest.fixture
@@ -663,11 +673,12 @@ def test_prepare_for_migration_targets_routed_bind_host(
     import ccs.cli._coherence_client as client_mod
 
     monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
-    _write_coherence_files(git_workspace, 54321)
+    pid_file = _write_coherence_files(git_workspace, 54321)
     posted: dict = {}
 
     def fake_post(endpoint, path, payload, **kw):
         posted["host"] = endpoint.host
+        release_coordinator_lock(pid_file)  # the stand-in stops, as asked
         return {"ok": True, "released": 1, "errors": []}
 
     monkeypatch.setattr(client_mod, "post", fake_post)
@@ -694,11 +705,12 @@ def test_prepare_for_migration_default_stays_loopback(
     POST and poll both target the resolver's loopback endpoint."""
     import ccs.cli._coherence_client as client_mod
 
-    _write_coherence_files(git_workspace, 54321)
+    pid_file = _write_coherence_files(git_workspace, 54321)
     posted: dict = {}
 
     def fake_post(endpoint, path, payload, **kw):
         posted["host"] = endpoint.host
+        release_coordinator_lock(pid_file)  # the stand-in stops, as asked
         return {"ok": True, "released": 0, "errors": []}
 
     monkeypatch.setattr(client_mod, "post", fake_post)
@@ -1112,6 +1124,65 @@ def test_prepare_for_migration_releases_grants_and_shuts_down(
         )
     except OSError:
         pass  # expected — connection refused after shutdown
+    # A closed port is not a stopped coordinator (#510): the command says
+    # "clean" only once the workspace lock is free, so a start can follow.
+    _assert_stopped_so_a_start_can_follow(workspace)
+
+
+def test_prepare_for_migration_route_alone_frees_the_workspace_for_the_next_start(
+    live_coordinator,
+) -> None:
+    """Prevents a client that calls the route directly, with no CLI to wait
+    for it, from leaving a worker that holds the workspace lock and its port
+    line after the port has closed (#510)."""
+    workspace, _port = live_coordinator
+    answer = post(
+        resolve_endpoint(workspace), "/admin/prepare-for-migration", {},
+        extra_headers={"Coherence-Local-Operator": "true"},
+    )
+    assert answer.get("draining") is True, answer
+    deadline = time.monotonic() + 15.0
+    while check_store(workspace).outcome is StoreCheckOutcome.LIVE:
+        assert time.monotonic() < deadline, (
+            "the workspace lock is still held 15s after prepare-for-migration: "
+            "the port closed but the coordinator's owner never finished stopping it"
+        )
+        time.sleep(0.05)
+    _assert_stopped_so_a_start_can_follow(workspace)
+
+
+def test_prepare_for_migration_does_not_say_clean_while_the_workspace_lock_is_held(
+    live_coordinator, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Prevents a clean report from a closed port alone while the coordinator
+    keeps the workspace lock and no start can follow, as a coordinator
+    without the #510 fix does."""
+    workspace, _port = live_coordinator
+    coordinator = lifecycle._SPAWNED_REGISTRY[str(workspace.resolve())].coordinator
+    # Stop as such a coordinator does: close the port, keep the lock.
+    coordinator.install_shutdown_sequence(coordinator.shutdown)
+    monkeypatch.setattr(coherence_coordinator, "_LOCK_RELEASE_TIMEOUT_SEC", 0.5)
+
+    rc = coherence_coordinator.main(["--root", str(workspace), "--prepare-for-migration"])
+
+    captured = capsys.readouterr()
+    assert rc == 2, captured
+    assert "still holds the workspace lock" in captured.err
+    assert "clean" not in captured.out
+
+
+def _assert_stopped_so_a_start_can_follow(workspace: Path) -> None:
+    """server.pid names no port, its lock is free, and a fresh start in
+    this workspace binds a coordinator that answers."""
+    assert read_port_from_file(workspace / ".coherence" / "server.pid") is None, (
+        "server.pid still names the stopped coordinator's port"
+    )
+    assert check_store(workspace).outcome is not StoreCheckOutcome.LIVE, (
+        "the workspace lock is still held"
+    )
+    port = ensure_coordinator(workspace, config=LifecycleConfig(idle_shutdown_sec=0, sweep_interval_sec=0))
+    assert port > 0
+    assert get(resolve_endpoint(workspace), "/status").get("ok") is not False
 
 
 # ----------------------------------------------------------------------

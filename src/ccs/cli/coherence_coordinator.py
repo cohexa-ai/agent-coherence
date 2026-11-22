@@ -95,7 +95,12 @@ from ccs.adapters.claude_code.lifecycle import (
 )
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.adapters.claude_code.state_dir import check_coherence_dir
-from ccs.adapters.claude_code.store_check import StoreCheckOutcome, check_store, store_is_held
+from ccs.adapters.claude_code.store_check import (
+    StoreCheckOutcome,
+    check_store,
+    store_is_held,
+    workspace_lock_held,
+)
 from ccs.cli._coherence_client import err, escape_nonprintable
 from ccs.coordinator.sqlite_registry import StoreHeldError
 from ccs.core.exceptions import CoherenceDirRefused
@@ -355,7 +360,8 @@ def _run_prepare_for_migration(
 
     Connects to the running coordinator, posts /admin/prepare-for-migration
     with the operator opt-in header, then polls the pid file + TCP probe
-    until the coordinator is genuinely gone. Returns 0 on clean
+    until the port closes and the workspace lock is free, so a start can
+    follow. Returns 0 on clean
     shutdown, 0 also when no coordinator was running (idempotent — safe
     to script as a pre-switch step that may or may not find a live
     coordinator), 2 on any error reaching the coordinator.
@@ -438,6 +444,14 @@ def _run_prepare_for_migration(
         )
         return 2
 
+    if not _wait_for_workspace_lock_free(root):
+        err(
+            "agent-coherence-coordinator: prepare-for-migration: the coordinator "
+            f"closed its port but still holds the workspace lock after "
+            f"{_LOCK_RELEASE_TIMEOUT_SEC:.0f}s, so no coordinator can start here yet"
+        )
+        return 2
+
     if not quiet:
         print(
             f"prepare-for-migration: released {released} grant(s); "
@@ -447,6 +461,25 @@ def _run_prepare_for_migration(
         if errors:
             print(f"  errors: {errors}", flush=True)
     return 0
+
+
+#: How long prepare-for-migration waits, after the port closes, for the
+#: coordinator to give up the workspace lock: its in-flight drain, watchdog and
+#: store close come first, so this sits well above their own limits.
+_LOCK_RELEASE_TIMEOUT_SEC = 15.0
+
+
+def _wait_for_workspace_lock_free(root: Path) -> bool:
+    """Whether the coordinator gave up the workspace lock within
+    :data:`_LOCK_RELEASE_TIMEOUT_SEC`. A closed port does not show that: a
+    coordinator can stop serving and keep the lock, and then no start can
+    follow it (#510)."""
+    deadline = time.monotonic() + _LOCK_RELEASE_TIMEOUT_SEC
+    while workspace_lock_held(root):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
 
 
 def _run_daemonized(root: Path, *, bind_host: str = "127.0.0.1") -> int:

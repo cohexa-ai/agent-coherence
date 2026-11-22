@@ -333,6 +333,20 @@ def store_is_held(coordinator_root: Path) -> bool:
         return False
 
 
+def workspace_lock_held(coordinator_root: Path) -> bool:
+    """True when a coordinator holds the workspace lock on
+    ``coordinator_root``'s ``.coherence/server.pid``, as the check's own probe
+    reads it. A coordinator can stop serving and still hold it, and no start
+    can follow until it lets go (#510). Creates nothing; a probe that fails,
+    or no ``fcntl``, reads as not held."""
+    if not _FCNTL_AVAILABLE:
+        return False
+    try:
+        return _coordinator_holds_lock(Path(coordinator_root) / ".coherence" / "server.pid")
+    except _CheckStopped:
+        return False
+
+
 def _store_held(db_path: Path) -> bool:
     """True when a read-write registry holds the store's single-writer lock
     (#453): a script, or a coordinator still closing after its workspace lock

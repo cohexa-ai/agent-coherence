@@ -42,6 +42,15 @@ def write_coordinator_pid_file(coherence_dir: Path, port: int, pid: int = 12345)
     return pid_file
 
 
+def release_coordinator_lock(pid_file: Path) -> None:
+    """Release the lock :func:`hold_coordinator_lock` took on ``pid_file``:
+    that stand-in coordinator stops, as a real one lets go when it stops."""
+    fd = _HELD.pop(pid_file.resolve(), None)
+    if fd is not None:
+        with suppress(OSError):
+            os.close(fd)
+
+
 def release_coordinator_locks() -> None:
     """Release every lock :func:`hold_coordinator_lock` took: the stand-in
     coordinators exit."""
