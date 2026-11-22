@@ -22,6 +22,7 @@ reason, and "cannot tell" (exit 2) never comes back as a pass.
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -54,6 +55,9 @@ SKIP_MESSAGES = {
 }
 FOREIGN_WRITE = (_ROW, "test_it_foreign_write_moves_version_agent_cas_fails")
 DSN_SKIP = "set CCS_TEST_PG_DSN (owner DSN) to run real Postgres tests"
+# The files the real-Postgres job runs; the workflow structure test pins the
+# job's command to the same two.
+JOB_FILES = ("tests/adapters/test_coherent_row.py", "tests/conformance/test_tier_honesty.py")
 
 PASSED = ""
 FAILURE = '<failure message="assert 1 == 2">E   assert 1 == 2</failure>'
@@ -283,3 +287,51 @@ def test_the_cli_on_a_bare_interpreter_returns_the_same_codes(tmp_path, cases, e
     )
     assert result.returncode == expected, result.stdout + result.stderr
     assert result.stdout.splitlines()[0].split(":")[0] in {"PASS", "FAIL", "CANNOT TELL"}
+
+
+@pytest.fixture(scope="module")
+def report_without_credentials(tmp_path_factory) -> Path:
+    """The job's pytest command over its two files, run with no ``CCS_*`` variable set.
+
+    Every gated test then skips, and its skip message says which variable it
+    waited for: enough to check the guard's tables against the tests that
+    exist, without a database or psycopg."""
+    report = tmp_path_factory.mktemp("no-credentials") / "junit.xml"
+    env = {name: value for name, value in os.environ.items() if not name.startswith("CCS_")}
+    cmd = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-m", "real_substrate", "-n", "0"]
+    proc = subprocess.run(
+        [*cmd, f"--junitxml={report}", *JOB_FILES],
+        cwd=_REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return report
+
+
+def test_the_tables_name_exactly_the_gated_tests_the_job_collects(guard, report_without_credentials):
+    keys = [report.key for report in guard.read_reports(report_without_credentials)]
+    assert len(keys) == len(set(keys))
+    assert set(keys) == guard.MUST_PASS | guard.ALLOWED_SKIP.keys()
+
+
+def test_each_gated_test_waits_for_the_variable_its_table_expects(guard, report_without_credentials):
+    """A must-pass test that skips without the owner DSN needs the database the
+    job provides; an allowed skip names the variable the job never sets."""
+    for report in guard.read_reports(report_without_credentials):
+        expected = guard.ALLOWED_SKIP.get(report.key, "CCS_TEST_PG_DSN")
+        assert report.outcome == "skipped", report
+        assert expected in report.message, report
+
+
+def test_the_guard_fails_a_run_without_a_database_naming_each_must_pass_test(
+    guard, report_without_credentials, capsys
+):
+    assert guard.main(["--junit-xml", str(report_without_credentials)]) == 1
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == f"FAIL: {len(guard.MUST_PASS)} problem(s) with the gated tests"
+    named = {line.strip().split(": ")[0] for line in lines[1:]}
+    assert named == {f"{classname}::{name}" for classname, name in guard.MUST_PASS}
