@@ -37,6 +37,19 @@ Alpha — APIs may change before `v1.0`.
   latest once that agent has held it for 30 minutes, which holds on both
   coordinators. A script or prompt that matches this deny byte for byte must
   accept the new wording.
+- **`agent-coherence-coordinator --prepare-for-migration` stops the
+  coordinator's process, not only its port (#510).** It printed
+  `coordinator shutdown clean` and exited 0 while the detached worker lived on,
+  holding the workspace lock and its port line in `server.pid`, so no session
+  start, CLI start or `CoherentVolume` could bring a coordinator up until
+  someone killed the worker, and with `.coherence/hook_on_held` set to
+  `refuse` every strict edit was denied meanwhile. A direct
+  `POST /admin/prepare-for-migration` did the same. The route now stops the
+  coordinator through the same sequence as an idle stop, which takes the port
+  out of `server.pid`, frees the lock and lets the worker exit, and the command
+  reports a clean stop only once the lock is free, including when it finds a
+  `server.pid` with no port. If the lock is still held, or cannot be checked,
+  15 seconds after the port closed, it exits `2`.
 
 ## [0.16.1] - 2026-11-15
 

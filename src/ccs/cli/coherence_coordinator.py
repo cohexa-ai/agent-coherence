@@ -95,7 +95,12 @@ from ccs.adapters.claude_code.lifecycle import (
 )
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.adapters.claude_code.state_dir import check_coherence_dir
-from ccs.adapters.claude_code.store_check import StoreCheckOutcome, check_store, store_is_held
+from ccs.adapters.claude_code.store_check import (
+    StoreCheckOutcome,
+    check_store,
+    store_is_held,
+    workspace_lock_held,
+)
 from ccs.cli._coherence_client import err, escape_nonprintable
 from ccs.coordinator.sqlite_registry import StoreHeldError
 from ccs.core.exceptions import CoherenceDirRefused
@@ -355,7 +360,8 @@ def _run_prepare_for_migration(
 
     Connects to the running coordinator, posts /admin/prepare-for-migration
     with the operator opt-in header, then polls the pid file + TCP probe
-    until the coordinator is genuinely gone. Returns 0 on clean
+    until the port closes and the workspace lock is free, so a start can
+    follow. Returns 0 on clean
     shutdown, 0 also when no coordinator was running (idempotent — safe
     to script as a pre-switch step that may or may not find a live
     coordinator), 2 on any error reaching the coordinator.
@@ -382,7 +388,11 @@ def _run_prepare_for_migration(
     except CoordinatorUnavailable as exc:
         # The pid file existed but the coordinator isn't reachable — it
         # may have died uncleanly. Nothing to release in the registry
-        # via HTTP; idempotent no-op.
+        # via HTTP; idempotent no-op. A pid file with no port can also be a
+        # stop still under way, or one stuck after dropping its port, so the
+        # lock decides whether this is clean.
+        if not _workspace_lock_released(root):
+            return 2
         if not quiet:
             print(
                 f"prepare-for-migration: coordinator not reachable ({exc}); "
@@ -438,6 +448,9 @@ def _run_prepare_for_migration(
         )
         return 2
 
+    if not _workspace_lock_released(root):
+        return 2
+
     if not quiet:
         print(
             f"prepare-for-migration: released {released} grant(s); "
@@ -447,6 +460,44 @@ def _run_prepare_for_migration(
         if errors:
             print(f"  errors: {errors}", flush=True)
     return 0
+
+
+#: How long prepare-for-migration waits, after the port closes, for the
+#: coordinator to give up the workspace lock: its in-flight drain, watchdog and
+#: store close come first, so this sits well above their own limits.
+_LOCK_RELEASE_TIMEOUT_SEC = 15.0
+
+
+def _workspace_lock_released(root: Path) -> bool:
+    """Whether the workspace lock was confirmed free within
+    :data:`_LOCK_RELEASE_TIMEOUT_SEC`; when not, says why on stderr. A closed
+    port does not show it: a coordinator can stop serving and keep the lock,
+    and then no start can follow it (#510). A probe that cannot tell is not a
+    free lock, so it is no clean stop either."""
+    held = _workspace_lock_after_wait(root)
+    if held is False:
+        return True
+    cause = (
+        "still holds the workspace lock" if held
+        else "left a workspace lock that could not be checked"
+    )
+    err(
+        f"agent-coherence-coordinator: prepare-for-migration: the coordinator "
+        f"{cause} after {_LOCK_RELEASE_TIMEOUT_SEC:.0f}s, so no coordinator "
+        "can be confirmed to start here yet"
+    )
+    return False
+
+
+def _workspace_lock_after_wait(root: Path) -> bool | None:
+    """:func:`workspace_lock_held` once it reads False, or as it last read
+    when :data:`_LOCK_RELEASE_TIMEOUT_SEC` runs out."""
+    deadline = time.monotonic() + _LOCK_RELEASE_TIMEOUT_SEC
+    while (held := workspace_lock_held(root)) is not False:
+        if time.monotonic() >= deadline:
+            return held
+        time.sleep(0.1)
+    return False
 
 
 def _run_daemonized(root: Path, *, bind_host: str = "127.0.0.1") -> int:

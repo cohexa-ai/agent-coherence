@@ -517,9 +517,9 @@ def ensure_coordinator_handle(
             # joiner (see _classify_join).
             bound_marker = (resolved_key, port)
             _BOUND_IN_THIS_PROCESS.add(bound_marker)
-            _write_pidfile(fd, os.getpid(), port)
-            coordinator.serve_in_thread()
-            entry = _SpawnedEntry(
+            # Not ``entry`` until it is registered: the handler below reads a
+            # set ``entry`` as a registered start (#429).
+            unregistered = _SpawnedEntry(
                 coordinator=coordinator,
                 lock_fd=fd,
                 coherence_dir=coherence_dir,
@@ -527,6 +527,14 @@ def ensure_coordinator_handle(
                 shutdown_done=threading.Event(),
                 bound_marker=bound_marker,
             )
+            # A stop the coordinator starts itself (prepare-for-migration)
+            # runs this same sequence, so it frees the lock too (#510).
+            # Installed before the port is published: a request that arrives
+            # the moment it is must not stop through shutdown() alone.
+            coordinator.install_shutdown_sequence(partial(_shutdown_sequence, unregistered))
+            _write_pidfile(fd, os.getpid(), port)
+            coordinator.serve_in_thread()
+            entry = unregistered
             _SPAWNED_REGISTRY[resolved_key] = entry
             _start_background_threads(entry, cfg)
             # G2 fix: self-probe with generous spawn-side budget before
