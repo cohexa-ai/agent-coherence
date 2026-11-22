@@ -24,7 +24,8 @@ import pytest
 
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig
 from ccs.adapters.coherent_volume import CoherentVolume, ManagedGlobEnforcement
-from ccs.core.exceptions import CoherenceError, OtherHolder
+from ccs.core.basis import BasisMember
+from ccs.core.exceptions import BasisCheckAbsent, CoherenceError, OtherHolder
 from tests.protocol_corpus.harness import (
     BACKEND_NODE,
     apply_setup,
@@ -43,6 +44,20 @@ _MEMBERS = ("data/a.md", "data/b.md")
 _NOT_SERVED = (
     "the coordinator does not serve {route} (HTTP 404), so nothing ran and a retry "
     "gets the same answer. The Node coordinator has no snapshot sessions or handoffs."
+)
+#: FROZEN duplicates of what the basis calls raise on a coordinator without the basis check.
+_ONLY_PYTHON = (
+    "Only the Python coordinator serves the basis check; the Node coordinator and "
+    "older Python coordinators do not."
+)
+_BASIS_NOT_SERVED = (
+    "the coordinator does not serve {route} (HTTP 404), so it cannot answer for a basis: "
+    f"nothing ran, and a retry gets the same answer. {_ONLY_PYTHON}"
+)
+_NO_REGISTRATION = (
+    "cannot record a basis member for {rel}: the coordinator answered the read without a "
+    "registration, so it does not serve the basis check. Only the Python coordinator "
+    "serves it; the Node coordinator and older Python coordinators do not."
 )
 _FAST = LifecycleConfig(
     idle_shutdown_sec=0,
@@ -198,6 +213,42 @@ def test_a_two_file_publish_names_the_route_and_writes_nothing(
 
     assert [(node_root / rel).read_bytes() for rel in _MEMBERS] == [b"old", b"old"]
     assert volume.is_attached and not volume.is_degraded
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+def test_the_basis_calls_raise_basis_check_absent_and_the_session_text_stays(
+    open_volume: VolumeFactory, node_root: Path, on_error: str
+) -> None:
+    """The Node coordinator does not serve the basis check: a read for a basis
+    gets no registration, and a check or a commit under a basis gets a 404.
+    Each raises ``BasisCheckAbsent`` with its own text, in both modes, writes
+    nothing and counts nothing degraded; a publish's 404 keeps its own text.
+
+    Prevents a volume on Node that takes the missing check for an unchanged
+    basis, or that answers it with the session routes' text."""
+    rel = _MEMBERS[0]
+    for member in _MEMBERS:
+        (node_root / member).write_bytes(b"old")
+    volume = open_volume(on_error=on_error)
+    member = BasisMember(rel, volume.read_with_version(rel)[1])
+
+    with pytest.raises(BasisCheckAbsent) as read:
+        volume.read_for_basis(rel)
+    with pytest.raises(BasisCheckAbsent) as check:
+        volume.check_basis([member])
+    with pytest.raises(BasisCheckAbsent) as commit:
+        volume.commit_if_basis([member], rel, member.version, b"new")
+
+    assert str(read.value) == _NO_REGISTRATION.format(rel=rel)
+    assert str(check.value) == _BASIS_NOT_SERVED.format(route="/basis/check")
+    assert str(commit.value) == _BASIS_NOT_SERVED.format(route="/basis/commit")
+    assert (node_root / rel).read_bytes() == b"old"
+    assert volume.is_attached and not volume.is_degraded
+
+    writes = [(each, volume.read_with_version(each)[1], b"new") for each in _MEMBERS]
+    with pytest.raises(CoherenceError) as publish:
+        volume.atomic_publish(writes)
+    assert str(publish.value) == _NOT_SERVED.format(route="/session/begin")
 
 
 def test_another_case_of_a_held_file_is_refused_where_the_disk_folds_case(

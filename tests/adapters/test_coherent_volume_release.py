@@ -28,6 +28,7 @@ from ccs.adapters.claude_code.lifecycle import LifecycleConfig
 from ccs.adapters.coherent_volume import CoherentVolume, coherent_workspace, install, uninstall
 from ccs.adapters.effect_gate import gate
 from ccs.cli._coherence_client import CoordinatorUnavailable, resolve_endpoint, resolve_remote_endpoint
+from ccs.core.basis import BasisMember
 from ccs.core.exceptions import (
     CoherenceDegradedWarning,
     CoherenceError,
@@ -695,6 +696,9 @@ _AFTER_CLOSE: dict[str, Callable[[CoherentVolume], object]] = {
     "write_cas": lambda v: v.write_cas(_X, lambda current: current),
     "write_cas_at": lambda v: v.write_cas_at(_X, 1, b"new"),
     "atomic_publish": lambda v: v.atomic_publish([(_X, 1, b"new")]),
+    "read_for_basis": lambda v: v.read_for_basis(_X),
+    "check_basis": lambda v: v.check_basis([BasisMember(_X, 1)]),
+    "commit_if_basis": lambda v: v.commit_if_basis([BasisMember(_X, 1)], _X, 1, b"new"),
     "transfer": lambda v: v.transfer(_X, successor="0" * 32),
     "accept": lambda v: v.accept(_X),
     "decline": lambda v: v.decline(_X),
