@@ -352,8 +352,6 @@ class ConformanceSubstrate:
         if entry is None:
             return CasConflict()
         if entry[1] != expected_token:
-            # The token this read found: no second store read, so the
-            # read-pair control's counter is undisturbed.
             return CasConflict(current_token=entry[1])
         return CasWritten(token=self._store.set(artifact_ref, bytes(new_bytes)))
 

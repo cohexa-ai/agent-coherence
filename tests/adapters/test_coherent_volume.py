@@ -3634,7 +3634,6 @@ def test_on_stale_write_allow_proceeds_and_clobbers(
         stop_coordinator(tmp_path)
 
 
-
 def test_foreign_write_with_the_hash_guard_off_is_reported_not_refused(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
@@ -3650,8 +3649,8 @@ def test_foreign_write_with_the_hash_guard_off_is_reported_not_refused(
     version moves to N+1. Only the volume's default hash guard (``"raise"``, see
     ``test_write_denies_foreign_edit_by_default``) refuses that write-back. This
     holds on a managed path and for a modification: after a foreign delete,
-    ``write()`` is neither refused nor reported, and a compare-and-set fails in
-    the volume with ``FileNotFoundError``."""
+    ``write()`` is neither refused nor reported (see
+    ``test_write_after_foreign_delete_proceeds``)."""
     target = _seed_file(tmp_path, content=b"v1")  # on disk only: no commit of our own
     vol = CoherentVolume(tmp_path, managed=("data/**",), on_stale_write="allow", config=fast_cfg)
     try:
@@ -3672,6 +3671,7 @@ def test_foreign_write_with_the_hash_guard_off_is_reported_not_refused(
     finally:
         stop_coordinator(tmp_path)
 
+
 def test_write_after_foreign_delete_proceeds(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
@@ -3682,7 +3682,8 @@ def test_write_after_foreign_delete_proceeds(
     try:
         vol.read("data/x.txt")
         target.unlink()                          # FOREIGN delete
-        vol.write("data/x.txt", b"recreated")    # None disk hash -> no deny
+        result = vol.write("data/x.txt", b"recreated")    # None disk hash -> no deny
+        assert result.disk_differs is False      # and nothing reports the delete
         assert target.read_bytes() == b"recreated"
     finally:
         stop_coordinator(tmp_path)

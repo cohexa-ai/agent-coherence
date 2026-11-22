@@ -549,9 +549,12 @@ class CoherentRow:
         except CoherenceError as exc:  # already scrubbed; an owned conn is dropped
             logger.debug("CoherentRow could not read the row after a refused write: %s", type(exc).__name__)
             return None
-        if row is None or not _is_usable_version(row[1]) or row[1] == expected_version:
+        if row is None:
             return None
-        return str(int(row[1]))
+        _value, version = row
+        if not _is_usable_version(version) or version == expected_version:
+            return None
+        return str(int(version))  # rendered exactly as read() renders it
 
     def _current_version_or_wedged(self, artifact_ref: str) -> int:
         row = self._fetch_row(artifact_ref)
