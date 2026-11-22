@@ -160,6 +160,9 @@ __all__ = [
     "WorkspaceMemberFacts",
     "WorkspaceRestoreFacts",
     "assert_abort_after_partial_visibility",
+    "assert_comparand_echoing_binding_is_rejected",
+    "assert_conflict_reports_a_read_back_token",
+    "assert_successor_computing_binding_is_rejected",
     "AcknowledgedWriteLost",
     "FSYNC_GRADE_EXEMPTION_REASON",
     "MANAGED_KILL_RUN_EXEMPTION_REASON",
@@ -346,8 +349,12 @@ class ConformanceSubstrate:
                 self._store.set(artifact_ref, bytes(new_bytes))
             return CasUnknown()
         entry = self._store.get(artifact_ref)
-        if entry is None or entry[1] != expected_token:
+        if entry is None:
             return CasConflict()
+        if entry[1] != expected_token:
+            # The token this read found: no second store read, so the
+            # read-pair control's counter is undisturbed.
+            return CasConflict(current_token=entry[1])
         return CasWritten(token=self._store.set(artifact_ref, bytes(new_bytes)))
 
     def reconcile_after_unknown(
@@ -623,18 +630,100 @@ def assert_read_pair_split_binding_is_rejected() -> None:
         assert_read_pair_is_atomic(_SplitReadBinding("object"), None)  # type: ignore[arg-type]
 
 
+_REFUSAL_TOKEN_MISMATCH = "expected None or the token read after the refusal"
+
+
+def assert_conflict_reports_a_read_back_token(
+    binding: ConformanceBinding, make_session: "SessionFactory"
+) -> None:
+    """A refused bare ``cas_write`` reports either no token or the token a read
+    returns after the refusal — never the comparand it lost with.
+
+    ``CasConflict.current_token`` is a report value: ``None`` always conforms
+    (a binding may be unable to read one, as S3 refusals carry no ETag). A
+    reported token must be what the substrate holds afterwards. The artifact is
+    moved twice, with distinct bytes, so a token computed from the comparand
+    instead of read fails too. A binding whose read-back returns the comparand
+    itself (a re-inserted row, a content-hash token restored) must report None;
+    this sequential check cannot provoke that case, so it is the implementer's
+    rule to keep."""
+    del make_session  # a bare-substrate property; no coordinator needed
+    ref = _fresh_ref()
+    binding.seed(ref, b"seed")
+    view = binding.make_view()
+    _bytes, stale = view.read(ref)
+    binding.foreign_write(ref, b"outside-1")
+    binding.foreign_write(ref, b"outside-2")
+    _bytes, moved = binding.make_view().read(ref)
+    assert moved != stale, "premise: two outside writes did not move the token"
+    outcome = view.cas_write(ref, expected_token=stale, new_bytes=b"mine")
+    assert isinstance(outcome, CasConflict), f"a stale comparand must lose, got {outcome!r}"
+    assert outcome.current_token in (None, moved), (
+        f"a refused cas_write reported current_token={outcome.current_token!r}; "
+        f"{_REFUSAL_TOKEN_MISMATCH} ({moved!r}), never the comparand ({stale!r})"
+    )
+
+
+class _EchoesComparandSubstrate(ConformanceSubstrate):
+    """Reports the comparand it lost with as the current token — the refusal
+    token check MUST reject it (teeth certification)."""
+
+    def cas_write(self, artifact_ref: str, *, expected_token: str, new_bytes: bytes) -> CasWriteResult:
+        outcome = super().cas_write(artifact_ref, expected_token=expected_token, new_bytes=new_bytes)
+        return CasConflict(current_token=expected_token) if isinstance(outcome, CasConflict) else outcome
+
+
+class _ComputesSuccessorSubstrate(ConformanceSubstrate):
+    """Reports the token after the comparand without reading the store — the
+    refusal token check MUST reject it once the artifact moved twice."""
+
+    def cas_write(self, artifact_ref: str, *, expected_token: str, new_bytes: bytes) -> CasWriteResult:
+        outcome = super().cas_write(artifact_ref, expected_token=expected_token, new_bytes=new_bytes)
+        if not isinstance(outcome, CasConflict):
+            return outcome
+        prefix, _, counter = expected_token.rpartition("-")
+        return CasConflict(current_token=f"{prefix}-{int(counter) + 1}")
+
+
+class _RefusalTokenStubBinding(InMemoryBinding):
+    """An in-memory binding whose views are one of the refusal-token stubs."""
+
+    def __init__(self, view_type: type[ConformanceSubstrate]) -> None:
+        super().__init__("object")
+        self._view_type = view_type
+
+    def make_view(self) -> ConformanceSubstrate:
+        return self._view_type(self._store, self._arm)
+
+
+def assert_comparand_echoing_binding_is_rejected() -> None:
+    """Confirm the refusal token check has TEETH against a binding that reports
+    the comparand (helper for the MUST-FAIL test)."""
+    with _expect_raises(AssertionError, match=_REFUSAL_TOKEN_MISMATCH):
+        assert_conflict_reports_a_read_back_token(_RefusalTokenStubBinding(_EchoesComparandSubstrate), None)  # type: ignore[arg-type]
+
+
+def assert_successor_computing_binding_is_rejected() -> None:
+    """Confirm the refusal token check has TEETH against a binding that computes
+    the next token instead of reading it (helper for the MUST-FAIL test)."""
+    with _expect_raises(AssertionError, match=_REFUSAL_TOKEN_MISMATCH):
+        assert_conflict_reports_a_read_back_token(_RefusalTokenStubBinding(_ComputesSuccessorSubstrate), None)  # type: ignore[arg-type]
+
+
 def run_native_cas_conformance(
     binding: ConformanceBinding, make_session: "SessionFactory"
 ) -> None:
     """The substrate-agnostic native-CAS arm — run against the fake AND real
     substrates. (i) proves the bare CAS; (ii) proves the coordinator's
     invalidation-before-act; (a) pins never-ship-a-store on the wire; and the
-    read-pair-atomicity control certifies the SHIPPED read is not split."""
+    read-pair-atomicity control certifies the SHIPPED read is not split; a
+    refused bare CAS reports no token or the one read after the refusal."""
     assert_native_cas_descriptor(binding.descriptor)
     assert_racing_writers_one_winner(binding, make_session)
     assert_invalidation_before_act(binding, make_session)
     assert_never_ship_a_store_wire(binding, make_session)
     assert_read_pair_is_atomic(binding, make_session)
+    assert_conflict_reports_a_read_back_token(binding, make_session)
 
 
 # ===========================================================================
