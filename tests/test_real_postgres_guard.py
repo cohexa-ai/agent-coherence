@@ -28,6 +28,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _TOOL_PATH = _REPO_ROOT / "tools" / "real_postgres_guard.py"
@@ -117,10 +118,16 @@ def guard():
     return _import_guard()
 
 
-def _judge(guard, tmp_path: Path, cases: list[Case], capsys) -> tuple[int, list[str]]:
-    report = _write_report(tmp_path / "junit.xml", cases)
-    exit_code = guard.main(["--junit-xml", str(report)])
-    return exit_code, capsys.readouterr().out.splitlines()
+@pytest.fixture
+def judge(guard, tmp_path, capsys):
+    """Run the guard on a report holding the given cases; return its exit code and printed lines."""
+
+    def run(cases: list[Case]) -> tuple[int, list[str]]:
+        report = _write_report(tmp_path / "junit.xml", cases)
+        exit_code = guard.main(["--junit-xml", str(report)])
+        return exit_code, capsys.readouterr().out.splitlines()
+
+    return run
 
 
 def _node(key: tuple[str, str]) -> str:
@@ -134,8 +141,8 @@ def test_the_tables_are_the_pinned_six_and_two(guard):
     assert dict(guard.ALLOWED_SKIP) == ALLOWED_SKIP
 
 
-def test_six_passes_and_two_expected_skips_pass(guard, tmp_path, capsys):
-    exit_code, lines = _judge(guard, tmp_path, _healthy(), capsys)
+def test_six_passes_and_two_expected_skips_pass(judge):
+    exit_code, lines = judge(_healthy())
     assert exit_code == 0
     assert lines[0].startswith("PASS")
     assert "6 passed" in lines[0]
@@ -143,9 +150,9 @@ def test_six_passes_and_two_expected_skips_pass(guard, tmp_path, capsys):
 
 
 @pytest.mark.parametrize("key", sorted(MUST_PASS))
-def test_a_must_pass_test_that_skipped_fails_naming_it(guard, tmp_path, capsys, key):
+def test_a_must_pass_test_that_skipped_fails_naming_it(judge, key):
     cases = _replace(_healthy(), key, _skip(DSN_SKIP))
-    exit_code, lines = _judge(guard, tmp_path, cases, capsys)
+    exit_code, lines = judge(cases)
     assert exit_code == 1
     assert lines[0].startswith("FAIL")
     assert any(_node(key) in line and "skipped" in line and DSN_SKIP in line for line in lines)
@@ -156,32 +163,32 @@ def test_a_must_pass_test_that_skipped_fails_naming_it(guard, tmp_path, capsys, 
     [(FAILURE, "failed"), (SETUP_ERROR, "error"), (TEARDOWN_ERROR, "error"), (XFAIL, "xfail")],
     ids=["failure", "setup-error", "teardown-error-after-pass", "xfail"],
 )
-def test_a_must_pass_test_that_did_not_pass_fails_naming_it(guard, tmp_path, capsys, child, outcome):
+def test_a_must_pass_test_that_did_not_pass_fails_naming_it(judge, child, outcome):
     cases = _replace(_healthy(), FOREIGN_WRITE, child)
-    exit_code, lines = _judge(guard, tmp_path, cases, capsys)
+    exit_code, lines = judge(cases)
     assert exit_code == 1
     assert lines[0].startswith("FAIL")
     assert any(_node(FOREIGN_WRITE) in line and outcome in line for line in lines)
 
 
-def test_a_failure_plus_a_teardown_error_fails_on_both_reports(guard, tmp_path, capsys):
+def test_a_failure_plus_a_teardown_error_fails_on_both_reports(judge):
     cases = _replace(_healthy(), FOREIGN_WRITE, FAILURE) + [(FOREIGN_WRITE, TEARDOWN_ERROR)]
-    exit_code, lines = _judge(guard, tmp_path, cases, capsys)
+    exit_code, lines = judge(cases)
     assert exit_code == 1
     assert any(_node(FOREIGN_WRITE) in line and "reported 2 times" in line for line in lines)
     assert any(_node(FOREIGN_WRITE) in line and "failed" in line for line in lines)
 
 
-def test_a_test_reported_twice_fails_even_when_both_reports_passed(guard, tmp_path, capsys):
+def test_a_test_reported_twice_fails_even_when_both_reports_passed(judge):
     cases = _healthy() + [(FOREIGN_WRITE, PASSED)]
-    exit_code, lines = _judge(guard, tmp_path, cases, capsys)
+    exit_code, lines = judge(cases)
     assert exit_code == 1
     assert any(_node(FOREIGN_WRITE) in line and "reported 2 times" in line for line in lines)
 
 
 @pytest.mark.parametrize("key", sorted(MUST_PASS | set(ALLOWED_SKIP)))
-def test_a_table_entry_missing_from_the_report_fails_naming_it(guard, tmp_path, capsys, key):
-    exit_code, lines = _judge(guard, tmp_path, _without(_healthy(), key), capsys)
+def test_a_table_entry_missing_from_the_report_fails_naming_it(judge, key):
+    exit_code, lines = judge(_without(_healthy(), key))
     assert exit_code == 1
     assert lines[0].startswith("FAIL")
     assert any(_node(key) in line and "missing" in line for line in lines)
@@ -198,10 +205,8 @@ def test_a_table_entry_missing_from_the_report_fails_naming_it(guard, tmp_path, 
     ],
     ids=["passed", "failed", "other-reason", "blank-skip"],
 )
-def test_an_allowed_skip_that_did_not_skip_for_its_reason_fails_naming_it(
-    guard, tmp_path, capsys, key, child, outcome
-):
-    exit_code, lines = _judge(guard, tmp_path, _replace(_healthy(), key, child), capsys)
+def test_an_allowed_skip_that_did_not_skip_for_its_reason_fails_naming_it(judge, key, child, outcome):
+    exit_code, lines = judge(_replace(_healthy(), key, child))
     assert exit_code == 1
     assert lines[0].startswith("FAIL")
     assert any(_node(key) in line and outcome in line and ALLOWED_SKIP[key] in line for line in lines)
@@ -215,30 +220,30 @@ def test_an_allowed_skip_that_did_not_skip_for_its_reason_fails_naming_it(
     ],
     ids=["xfail", "untyped"],
 )
-def test_an_allowed_skip_with_its_reason_but_not_a_plain_skip_fails(guard, tmp_path, capsys, child):
-    exit_code, lines = _judge(guard, tmp_path, _replace(_healthy(), REAL_S3, child), capsys)
+def test_an_allowed_skip_with_its_reason_but_not_a_plain_skip_fails(judge, child):
+    exit_code, lines = judge(_replace(_healthy(), REAL_S3, child))
     assert exit_code == 1
     assert any(_node(REAL_S3) in line for line in lines[1:])
 
 
-def test_an_unclassified_test_fails_naming_it(guard, tmp_path, capsys):
+def test_an_unclassified_test_fails_naming_it(judge):
     newcomer = (_ROW, "test_it_a_new_gated_test")
-    exit_code, lines = _judge(guard, tmp_path, _healthy() + [(newcomer, PASSED)], capsys)
+    exit_code, lines = judge(_healthy() + [(newcomer, PASSED)])
     assert exit_code == 1
     assert any(_node(newcomer) in line and "unclassified" in line for line in lines)
 
 
-def test_a_module_that_skipped_itself_at_collection_fails_as_unclassified(guard, tmp_path, capsys):
+def test_a_module_that_skipped_itself_at_collection_fails_as_unclassified(judge):
     module = ("", "tests.adapters.test_coherent_row")
     cases = _healthy() + [(module, _untyped_skip("collection skipped"))]
-    exit_code, lines = _judge(guard, tmp_path, cases, capsys)
+    exit_code, lines = judge(cases)
     assert exit_code == 1
     assert any("tests.adapters.test_coherent_row" in line and "unclassified" in line for line in lines)
 
 
-def test_named_tests_are_capped_with_a_count_of_the_rest(guard, tmp_path, capsys):
+def test_named_tests_are_capped_with_a_count_of_the_rest(guard, judge):
     extras = [((_ROW, f"test_extra_{index:02d}"), PASSED) for index in range(25)]
-    exit_code, lines = _judge(guard, tmp_path, _healthy() + extras, capsys)
+    exit_code, lines = judge(_healthy() + extras)
     assert exit_code == 1
     assert sum("test_extra_" in line for line in lines) == guard.MAX_NAMED
     assert any(f"and {25 - guard.MAX_NAMED} more" in line for line in lines)
@@ -311,6 +316,14 @@ def report_without_credentials(tmp_path_factory) -> Path:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     return report
 
+
+def test_the_drift_run_covers_the_files_the_job_runs():
+    """A file named in the job's pytest step but not here would reach the job with
+    its tests unclassified: red there, but never in the default suite."""
+    workflow = yaml.safe_load((_REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    steps = workflow["jobs"]["real-postgres"]["steps"]
+    (run,) = [step["run"] for step in steps if step.get("name") == "Run the gated tests against Postgres"]
+    assert sorted(token for token in run.split() if token.startswith("tests/")) == sorted(JOB_FILES)
 
 def test_the_tables_name_exactly_the_gated_tests_the_job_collects(guard, report_without_credentials):
     keys = [report.key for report in guard.read_reports(report_without_credentials)]
