@@ -226,6 +226,7 @@ def test_cas_write_412_precondition_failed_is_conflict() -> None:
     # Stale comparand: the object is at "current", we present "stale".
     result = obj.cas_write("k", expected_token='"stale"', new_bytes=b"v2")
     assert isinstance(result, CasConflict)
+    assert result.current_token is None  # a 412 carries no current ETag
 
 
 def test_stale_token_write_returns_cas_conflict() -> None:
@@ -243,6 +244,7 @@ def test_cas_write_409_classified_retryable_but_no_write_landed() -> None:
     result = obj.cas_write("k", expected_token='"cur"', new_bytes=b"v2")
     # Contract 3-way: no write landed → CasConflict...
     assert isinstance(result, CasConflict)
+    assert result.current_token is None  # a 409 carries no current ETag
     # ...but the fine-grained classifier marks it RETRYABLE (re-read etag, retry).
     assert classify_put_exception(_FakeClientError("ConditionalRequestConflict")) is S3PutOutcome.RETRYABLE
 
@@ -251,6 +253,7 @@ def test_cas_write_404_raced_delete_is_conflict_not_recreate() -> None:
     obj, client = _make()  # object absent → If-Match put 404s
     result = obj.cas_write("k", expected_token='"gone"', new_bytes=b"v2")
     assert isinstance(result, CasConflict)
+    assert result.current_token is None  # the object is gone: no token to report
     assert classify_put_exception(_FakeClientError("NoSuchKey")) is S3PutOutcome.RACED_DELETE
 
 

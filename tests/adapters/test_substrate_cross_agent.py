@@ -2641,3 +2641,26 @@ def test_a_2xx_that_is_not_an_object_is_unreachable_on_a_read_and_unconfirmed_on
         httpd.shutdown()
         httpd.server_close()
         stop_coordinator(tmp_path)
+
+
+# --- the refusal result: what a lost compare-and-set reports ------------------
+
+
+def test_a_refusal_reports_no_token_unless_the_binding_read_one() -> None:
+    assert CasConflict().current_token is None
+
+
+def test_a_refusal_takes_its_token_by_keyword_only() -> None:
+    """A positional token reads like the comparand the caller lost with, so the
+    field refuses one."""
+    with pytest.raises(TypeError):
+        CasConflict("5")  # type: ignore[misc]
+
+
+def test_a_refusal_with_a_token_is_not_equal_to_a_bare_refusal() -> None:
+    """Callers that compared a result with ``CasConflict()`` must use isinstance
+    once a binding reports the token; both stay hashable."""
+    reported = CasConflict(current_token="6")
+    assert reported != CasConflict()
+    assert reported == CasConflict(current_token="6")
+    assert len({reported, CasConflict()}) == 2
