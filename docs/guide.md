@@ -664,7 +664,7 @@ What the software does not do, in one place: a list of limits, then [when each g
 - **No check of an earlier approval's inputs.** `gate()`, `swg_gate` and `POST /hooks/effect-fence` check one input per call, and a [snapshot session](#multi-artifact-snapshot-sessions) pins its inputs when it begins. No call takes the versions a review or approval read earlier, across several inputs, and checks them all at one instant without rewriting them. That check is proposed in [#653](https://github.com/Cohexa-ai/agent-coherence/issues/653) and is not shipped.
 - **Recovery is the agent's.** Over MCP a refusal carries a `recover` verb and often a `next_step`, and in Python it is a typed exception ([MCP server](#stale-write-guard-fs-mcp-server)). The agent then re-reads, rebuilds its change and retries, and nothing here merges content or rebuilds a change for it. `CoherentVolume.write_cas` does retry inside the call, but each retry only runs your `make_content` again on the current bytes, so the rebuild is still your code ([details](#concurrent-writers-write_cas)).
 - **No verdict on the work.** It checks that what an agent read is still current. It does not judge whether the result is right or the task is done.
-- **Claude Code warns by default.** The Claude Code hooks deny a session whose copy of a file went stale only in strict mode, on the files you opt in ([details](#after-a-strict-mode-stale-deny)). By default, if the coordinator is overloaded or does not answer, the hook lets the call through, in strict mode too ([#223](https://github.com/Cohexa-ai/agent-coherence/issues/223)). By default the hooks also do not settle two sessions editing one file at the same time: the later edit is admitted with a note ([details](#acquire-or-fail-on-pre-edit)).
+- **Claude Code warns by default.** The Claude Code hooks deny a session whose copy of a file went stale only in strict mode, on the files you opt in ([details](#after-a-strict-mode-stale-deny)). By default, if the coordinator is overloaded or does not answer, the hook lets the call through, in strict mode too ([#223](https://github.com/Cohexa-ai/agent-coherence/issues/223)); for an Edit or Write sent to a running coordinator, this package's hook client (`agent-coherence-hook-client`) also tells the model the check did not run, and the plugin's Node hook client does not ([details](#when-a-claude-code-edit-gets-no-answer)). By default the hooks also do not settle two sessions editing one file at the same time: the later edit is admitted with a note ([details](#acquire-or-fail-on-pre-edit)).
 - **Python, or MCP.** The library is Python 3.11+. An agent in another language reaches it through the [MCP server](#stale-write-guard-fs-mcp-server), or the [HTTP effect fence](#effect-fence-over-http) on the same host, and there is no TypeScript or Go SDK. The Claude Code plugin ships its own Node coordinator, which has no caller principals, sweep, snapshot sessions or handoffs ([details](#a-volume-on-the-node-coordinator)).
 - **`ccs-diagnose` only reports.** It observes one run of one LangGraph graph in one process and reports reads that were handed different versions. It denies no read and no write, and it cannot see divergence across separate OS processes ([reference](ccs-diagnose.md)).
 - **No dashboard.** Nothing here shows a running fleet: there is no web UI and no live chart of coordinator state. You read typed results and what the `agent-coherence-status` command prints for either coordinator ([status](#status-track-and-untrack-commands)), and `CCSStore` can send per-operation metrics to OpenTelemetry or LangSmith ([telemetry](#telemetry)). The pages and charts that exist are static files: an HTML report from `ccs-diagnose`, `ccs-simulate` or `ccs-compare`, and the benchmark curve that `tools/plot_cost_sweep.py` draws. Counters exist on the Python coordinator only: in `/status`, and in its `state.db`, which you read offline ([conflict-outcome counters](#conflict-outcome-counters--how-often-did-it-actually-fire), [foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)).
@@ -2677,7 +2677,10 @@ edit as before, because no coordinator is known that could hold the file; a
 coordinator shown gone (the lock free, for a `backend=node` file only once its
 pid no longer runs), a file it cannot read, and a link or anything but a pid
 file deny the edit. Every other hook event, and that edit with the refusal
-off, sends nothing and prints `{}` in all of these cases, as before.
+off, sends nothing and prints `{}` in all of these cases, as before. With the
+refusal off, a coordinator that exits after this check, while a `pre-edit` is
+under way, leaves that edit with the could-not-verify advisory instead (see
+[When a Claude Code edit gets no answer](#when-a-claude-code-edit-gets-no-answer)).
 
 A strict `CoherentVolume` raises the refusal as `CoordinatorUnreachable`, or as
 `CommitUnconfirmed` from a handoff verb; a degrade volume warns and counts a
@@ -2715,6 +2718,61 @@ list is in [A process on the coordinator's port](security.md#who-the-coordinator
 
 A remote coordinator has no pid file on this host and no such check; reach it
 over verified TLS.
+
+### When a Claude Code edit gets no answer
+
+A Claude Code hook never blocks a tool call because the coordinator failed. On
+a failure the hook client prints `{}`, and Claude Code goes on as if no hook
+had run. A `pre-edit`, from an Edit or a Write, says more in one case: when it
+was sent to a running coordinator (one that holds the workspace lock; see
+[A client sends nothing to a coordinator that exited](#a-client-sends-nothing-to-a-coordinator-that-exited))
+and no decision came back. Then the client prints the could-not-verify
+advisory, as added context only:
+
+```json
+{"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "\u26a0 Coherence could not verify this file's freshness \u2014 the coordinator staleness check timed out under load. Proceeding WITHOUT a stale-read guarantee: if this file is shared with other agents or sessions, re-read it before relying on its contents."}}
+```
+
+The edit goes ahead. The answer carries no `permissionDecision`, so Claude
+Code asks about the edit exactly as it would if the hook had not answered, and
+the model is told the check did not run, in the words a hook uses when its
+check times out (see [When the registry is busy](#when-the-registry-is-busy)).
+
+| What happened to the `pre-edit` | What the hook prints |
+|---|---|
+| The coordinator answered with a JSON object, a refusal included | that answer, as before |
+| The coordinator answered `200` with its failure envelope, `{"ok": false, "reason": "internal: <type>"}`: its handler raised before deciding, as when its store stayed locked past its wait | the advisory |
+| HTTP `5xx`: every handler busy, a failure inside the coordinator (`500`), a coordinator stopping or draining for a migration (`503`) | the advisory |
+| The connection was reset or closed early, the answer was cut short, no answer came within the client's timeout, or the coordinator never accepted the connection | the advisory |
+| Nothing listens on the port (the connection is refused) | `{}` |
+| No coordinator is known, or one is shown gone, before anything is sent | `{}` |
+| HTTP `4xx`, or a redirect | `{}` |
+| An empty or non-JSON `2xx` answer | `{}` |
+| The caller principal is refused and recovery cannot cure it | `{}`, with the stderr line it always wrote |
+
+- The advisory says the check "timed out under load" whichever of these
+  failures it reports: a `500`, a failure envelope, a reset and a stopping
+  coordinator get the same words.
+- A coordinator that exits while the request is under way gives the advisory,
+  even when it stops cleanly: the check before the send cannot see an exit
+  that comes after it.
+- The client waits up to 6 seconds for each request. Until a claim of the
+  session's caller principal is confirmed, a hook sends two, the claim and then
+  its own request, and against a coordinator that accepts connections and
+  never answers no claim is ever confirmed. So there every edit costs up to 12
+  seconds, and Claude Code's timeout for the hook must be longer than that for
+  the advisory to reach the model. A hook that Claude Code stops first shows
+  the model nothing.
+- Nothing is retried
+  ([#414](https://github.com/Cohexa-ai/agent-coherence/issues/414)).
+- Every other hook event (Read, Bash, Grep, the edit's PostToolUse, session
+  start and stop) still prints `{}` on all of these failures, and so does the
+  plugin's Node hook client for an edit
+  ([#223](https://github.com/Cohexa-ai/agent-coherence/issues/223)).
+- With the
+  [refusal of held strict files](#refusing-a-held-strict-file-in-claude-code-sessions)
+  on, the edit of a strict path keeps its own answers: any failure after a
+  coordinator is known denies it with the unavailable deny.
 
 ### Atomic multi-file publish: `atomic_publish` (v0.12.0+)
 
@@ -5719,7 +5777,9 @@ with its own policy, and each bounds its wait in its own way:
   before. This package's coordinator does not track it either and admits the
   Node client's opted-in edit as untracked, so there the two clients differ
   only when the coordinator does not answer: the Node client gives the
-  unavailable deny where this package's client prints `{}`.
+  unavailable deny where this package's client prints the could-not-verify
+  advisory, or `{}` when nothing listens on the port (see
+  [When a Claude Code edit gets no answer](#when-a-claude-code-edit-gets-no-answer)).
 - **Names under `subject:`.** The Node hook client never counts a file whose
   name starts with the reserved `subject:` prefix as strict, so it never opts
   in for one. This package's coordinator treats a file such as
@@ -5731,6 +5791,11 @@ with its own policy, and each bounds its wait in its own way:
   [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)), so with the
   setting on, this package's client gets the unavailable deny there for every
   edit of a strict file whose name starts with `subject:`.
+- **An edit the coordinator did not decide.** With the setting off, or for a
+  file neither client counts as strict, this package's client prints the
+  could-not-verify advisory for a `pre-edit` that a running coordinator
+  answered with a `5xx` or its failure envelope, or did not answer, and the
+  Node hook client does not (see [When a Claude Code edit gets no answer](#when-a-claude-code-edit-gets-no-answer)).
 - **Timing.** The Node hook client bounds the whole decision by one 5-second
   deadline, and this package's client gives each request its own 6-second
   timeout (see **When the coordinator does not answer** below).
