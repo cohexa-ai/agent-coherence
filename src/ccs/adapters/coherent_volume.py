@@ -4129,11 +4129,7 @@ class CoherentVolume:
         abs_path, rel = self._to_relative(target)
         described = self._basis_target(members, rel, expected_target_version)
         self._remint()
-        # A path this volume never read gets the baseline a later write()
-        # checks against, as write_cas_at's comparand read records one.
-        disk_hash = self._disk_hash(abs_path)
-        if disk_hash is not None:
-            self._last_observed_hash.setdefault(self._key_of(rel), disk_hash)
+        self._seed_foreign_edit_baseline(abs_path, rel)
         new_hash = self._sha256_bytes(content)
         resp = self._post_basis_commit(rel, {
             "session_id": self._session_id,
@@ -4148,6 +4144,17 @@ class CoherentVolume:
         self._record_own_write(rel, new_hash)
         assert answer.committed is not None  # a settled proceed always names it
         return CasCommitResult(path=rel, version=answer.committed.version, handoff=self._win_outcome(resp))
+
+    def _seed_foreign_edit_baseline(self, abs_path: Path, rel: str) -> None:
+        """Give a path this volume never read the baseline a later ``write()``
+        checks against, as ``write_cas_at``'s comparand read records one. A
+        path that already has a baseline keeps it, so its disk is not read."""
+        key = self._key_of(rel)
+        if key in self._last_observed_hash:
+            return
+        disk_hash = self._disk_hash(abs_path)
+        if disk_hash is not None:
+            self._last_observed_hash[key] = disk_hash
 
     def _post_basis_commit(self, rel: str, body: dict) -> object:
         """Send one commit under a basis and return its answer, mapped as
@@ -4259,9 +4266,9 @@ class CoherentVolume:
             described = BasisMember(rel, expected_target_version, None, self._basis_name_kind())
         except ValueError as exc:
             raise ValueError(f"target: {exc}") from None
-        key = self._basis_key(rel)
+        target_row = (rel, self._basis_key(rel), None)
         for member in members:
-            if member.path == rel or self._basis_key(member.path) == key:
+            if _names_one_row(target_row, (member.path, self._basis_key(member.path), member.registration)):
                 if member.version != described.version:
                     raise ValueError(
                         "target names a basis member but disagrees with its path, version or registration"

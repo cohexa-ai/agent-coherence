@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import logging
 import secrets
@@ -79,7 +78,7 @@ from ccs.core.exceptions import (
 from ccs.core.hashing import compute_content_hash
 from ccs.core.invariants import check_monotonic_version, check_single_writer
 from ccs.core.states import MESIState, TransientState
-from ccs.core.substrate import RestoreTier
+from ccs.core.substrate import RestoreTier, sha256_hex
 from ccs.core.types import (
     TRANSFER_STATUS_COMPLETED,
     TRANSFER_STATUS_DECLINED,
@@ -4513,7 +4512,7 @@ def _body_hash(body: bytes | str) -> str:
     digest as the text those bytes encode)."""
     if isinstance(body, str):
         return compute_content_hash(body)
-    return hashlib.sha256(body).hexdigest()
+    return sha256_hex(body)
 
 
 def _classified(

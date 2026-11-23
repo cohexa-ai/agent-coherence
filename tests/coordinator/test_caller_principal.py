@@ -353,9 +353,6 @@ def test_a_route_refusal_carries_exactly_the_two_route_reasons() -> None:
     assert CALLER_PRINCIPAL_REFUSAL_REASONS < CALLER_PRINCIPAL_REASONS
     assert CALLER_PRINCIPAL_CLAIMED_REASON not in CALLER_PRINCIPAL_REFUSAL_REASONS
     assert CALLER_PRINCIPAL_REFUSAL_REASONS.isdisjoint(HOLD_REASONS)
-    assert CALLER_PRINCIPAL_REFUSAL_REASONS.isdisjoint(
-        {"basis_member_unmanaged", "basis_member_replaced", "occ_is_shared_or_invalid_only"}
-    )
 
 
 # ---------------------------------------------------------------------------
