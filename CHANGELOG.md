@@ -8,6 +8,45 @@ Alpha — APIs may change before `v1.0`.
 
 ### Added
 
+- **A basis check: a caller that read several files records the version and
+  registration of each, and later learns in one step whether every one is
+  unchanged, and commits one file only if they all are
+  ([#653](https://github.com/Cohexa-ai/agent-coherence/issues/653),
+  [#652](https://github.com/Cohexa-ai/agent-coherence/issues/652)).**
+  `CoherentVolume.read_for_basis(path)` returns the bytes and a `BasisMember`
+  (`ccs.core.basis`): the path, the confirmed version, and the registration of
+  the record read, which changes when a deleted path is registered again, so
+  a re-created file that restarts at version 1 is not taken for the one read.
+  A member is plain data that another process rebuilds with
+  `BasisMember(**fields)`. `check_basis` answers `proceed` with every
+  member's expected and current version, or `hold` with every moved member,
+  one reason each from a closed set (`version_moved`, `input_vanished`,
+  `basis_member_unmanaged`, `basis_member_replaced`, `version_unconfirmed`)
+  and a recovery class (`rederive` or `retry`). Every member is compared at
+  one instant, under the service's session lock and then the registry lock,
+  and the check registers, grants and changes nothing. `commit_if_basis`
+  compare-and-swaps one target, inside or outside the basis, only while the
+  basis and the target are unchanged, comparing the basis again inside the
+  target's own transaction; it never rewrites another input. A target refused
+  while the basis held is reported apart from the members, and a commit whose
+  outcome is unknown answers `commit_unconfirmed`. Both are offered in process
+  (`CoordinatorService.basis_member`, `check_basis`, `commit_if_basis`), on
+  `CoherentVolume`, and on the Python coordinator as `POST /basis/check` and
+  `POST /basis/commit`, which take a strict schema (a malformed request is
+  `400`, never a hold), keep the bearer, caller-principal and counter rules
+  of the other routes, answer a hold when the locks cannot be taken in time,
+  and refuse a commit with `503` during a migration drain. A
+  `/hooks/pre-read` that sets `want_registration: true` reports the
+  registration beside the version, and a pre-read carrying the field is not
+  taken for a Claude Code hook read. The volume's basis calls raise in both
+  `on_error` modes rather than take silence for unchanged, and raise
+  `BasisCheckAbsent` against a coordinator that does not serve them, such as
+  the Claude Code plugin's Node coordinator. The check compares versions and
+  registrations only: a byte-identical re-save holds, and grant state and the
+  ownership generation are not consulted. `examples/basis_gate/` adds
+  `stale_check.py` and `stale_approval.py`, and the guide's "Basis check"
+  section documents every answer, the HTTP tables, the measured lock-hold
+  time and the limits.
 - **The Claude Code plugin's Node hook client follows the same refusal of
   edits of held strict files, and the shared fixtures carry the two stderr
   lines and are checked against the plugin's copy.** In plugin releases after
