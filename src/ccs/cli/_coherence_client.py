@@ -338,6 +338,53 @@ class CoordinatorMalformedAnswer(CoordinatorUnavailable):
     """
 
 
+#: How a request to the coordinator ended. A published contract: a hook route
+#: decides what to print from these names, so they never change meaning.
+#: ``answered`` and ``handler_failed`` are the ones a caller reports itself,
+#: for a 2xx JSON answer: ``handler_failed`` when that answer is the
+#: coordinator's failure envelope (its handler raised, so nothing was decided),
+#: ``answered`` otherwise. :func:`classify_send_failure` returns one of the
+#: others for a failure.
+SEND_ANSWERED = "answered"
+SEND_HANDLER_FAILED = "handler_failed"
+SEND_HTTP_UNANSWERED = "http_unanswered"
+SEND_HTTP_REJECTED = "http_rejected"
+SEND_NO_LISTENER = "no_listener"
+SEND_TRANSPORT_UNANSWERED = "transport_unanswered"
+SEND_DEPARTED = "departed"
+SEND_MALFORMED_ANSWER = "malformed_answer"
+SEND_PRINCIPAL_REFUSED = "principal_refused"
+SEND_UNEXPECTED = "unexpected"
+
+
+def classify_send_failure(exc: BaseException) -> str:
+    """Name how a request to the coordinator failed, for any route.
+
+    The order matters. A departed coordinator and a malformed answer carry no
+    cause, so they are matched by type before the rule that reads a cause-less
+    failure as a broken answer; an ``HTTPError`` is also a ``URLError`` with a
+    ``reason``, so it is matched before the cause is read. ``never_sent`` is
+    never consulted: a refused connect and a send into a full accept queue both
+    set it, and only the first means nobody was listening.
+    """
+    if isinstance(exc, CoordinatorDeparted):
+        return SEND_DEPARTED
+    if isinstance(exc, CoordinatorMalformedAnswer):
+        return SEND_MALFORMED_ANSWER
+    if isinstance(exc, CallerPrincipalRefused):
+        return SEND_PRINCIPAL_REFUSED
+    if isinstance(exc, urllib.error.HTTPError):
+        return SEND_HTTP_UNANSWERED if exc.code >= 500 else SEND_HTTP_REJECTED
+    if isinstance(exc, RedirectRefused):
+        return SEND_HTTP_REJECTED
+    if not isinstance(exc, CoordinatorUnavailable):
+        return SEND_UNEXPECTED
+    inner = getattr(exc.__cause__, "reason", exc.__cause__)
+    if isinstance(inner, ConnectionRefusedError):
+        return SEND_NO_LISTENER
+    return SEND_TRANSPORT_UNANSWERED
+
+
 def _read_ca_bundle(ca_file: str) -> str:
     """Read a private-CA PEM bundle with the same discipline as ``_read_secret``.
 

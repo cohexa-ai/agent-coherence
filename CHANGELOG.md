@@ -103,6 +103,26 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **A Claude Code edit the coordinator did not decide now tells the model.**
+  A `pre-edit` sent to a running coordinator that answered with a `5xx` (every
+  handler busy, a failure inside the coordinator, a stop or a migration drain)
+  or failed in transport any way but a refused connection (a reset, a cut-short
+  answer, no answer within the client's timeout) printed `{}`, so the edit went
+  ahead and the model was never told the check did not run. A `pre-edit` the
+  coordinator answered with its own failure envelope, a `200` with `ok: false`
+  and a reason starting `internal:` (its handler raised before deciding, as
+  when its store stayed locked past its wait), was printed as it came, which
+  Claude Code ignores. The hook client now prints the could-not-verify
+  advisory in all of these cases, as added context with no
+  `permissionDecision`, so the edit still goes ahead. Nothing listening on the
+  port, a `4xx` or a redirect, an empty or non-JSON `2xx` answer and a refused caller
+  principal still print `{}`, as does every other hook event. Only the Python
+  hook client's `pre-edit` output changes; the plugin's Node hook client is
+  unchanged ([#223](https://github.com/Cohexa-ai/agent-coherence/issues/223)).
+  The advisory's words say the check "timed out under load", and it now
+  stands for a reset, a `500`, a failure envelope or a stopping coordinator
+  too. Nothing is
+  retried ([#414](https://github.com/Cohexa-ai/agent-coherence/issues/414)).
 - **The user guide has one "Limits and boundaries" section.** What the
   software does not do was spread across the README and many "Scope,
   honestly" notes in the guide. `docs/guide.md` now has a top-level section
