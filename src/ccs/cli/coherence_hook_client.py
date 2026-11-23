@@ -183,7 +183,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     not anticipated) can violate the always-exit-0 hook contract.
 
     P2 ce-review fix #8 (reliability): top-level broad except guarantees the
-    hook contract — emit ``{}`` and exit 0 no matter what fails.
+    hook contract — emit ``{}`` and exit 0 on any unexpected failure. A
+    pre-edit a running coordinator did not decide is not one: it prints the
+    could-not-verify advisory (see the module's stdout contract).
     P3 ce-review fix #27 (agent-native): isatty guard prevents indefinite
     block when a developer runs the hook-client manually for testing.
     P3 ce-review fix #24 (cli-readiness): empty stdin path now emits ``{}``
