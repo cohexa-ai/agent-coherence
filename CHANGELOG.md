@@ -46,7 +46,10 @@ Alpha — APIs may change before `v1.0`.
   ownership generation are not consulted. `examples/basis_gate/` adds
   `stale_check.py` and `stale_approval.py`, and the guide's "Basis check"
   section documents every answer, the HTTP tables, the measured lock-hold
-  time and the limits.
+  time and the limits. The registry protocol gains two members,
+  `basis_rows` and `commit_cas_if_basis`, which every shipped backend
+  implements; a third-party registry written against the earlier protocol
+  must add them before the basis calls work on it.
 - **The Claude Code plugin's Node hook client follows the same refusal of
   edits of held strict files, and the shared fixtures carry the two stderr
   lines and are checked against the plugin's copy.** In plugin releases after
