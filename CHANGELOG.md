@@ -69,7 +69,7 @@ Alpha — APIs may change before `v1.0`.
   ahead and the model was never told the check did not run. The hook client
   now prints the could-not-verify advisory there, as added context with no
   `permissionDecision`, so the edit still goes ahead. Nothing listening on the
-  port, a `4xx` or a redirect, an empty or non-JSON answer and a refused caller
+  port, a `4xx` or a redirect, an empty or non-JSON `2xx` answer and a refused caller
   principal still print `{}`, as does every other hook event. Only the Python
   hook client's `pre-edit` output changes; the plugin's Node hook client is
   unchanged ([#223](https://github.com/Cohexa-ai/agent-coherence/issues/223)).

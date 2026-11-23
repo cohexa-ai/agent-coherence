@@ -65,7 +65,7 @@ advisory instead: ``hookSpecificOutput`` carrying
 :data:`~ccs.adapters.claude_code.coordinator_server.DEGRADED_FRESHNESS_ADVISORY`
 and no ``permissionDecision``. The edit still proceeds, and the model is told
 the coherence check did not run. Nothing listening on the port, a refused or
-redirected request, an empty or non-JSON answer and a refused caller principal
+redirected request, an empty or non-JSON 2xx answer and a refused caller principal
 print ``{}``, as does any failure on the other subcommands. Nothing is
 retried.
 
@@ -367,7 +367,7 @@ def _call(
 # and no decision came back: it answered a 5xx, or the request failed in
 # transport any way but a refused connection. The edit proceeds, and the model
 # is told the check did not run. Nothing listening, a refused or redirected
-# request, an empty or non-JSON answer and a refused principal print {}.
+# request, an empty or non-JSON 2xx answer and a refused principal print {}.
 _UNANSWERED = frozenset({SEND_HTTP_UNANSWERED, SEND_TRANSPORT_UNANSWERED})
 
 

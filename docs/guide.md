@@ -664,7 +664,7 @@ What the software does not do, in one place: a list of limits, then [when each g
 - **No check of an earlier approval's inputs.** `gate()`, `swg_gate` and `POST /hooks/effect-fence` check one input per call, and a [snapshot session](#multi-artifact-snapshot-sessions) pins its inputs when it begins. No call takes the versions a review or approval read earlier, across several inputs, and checks them all at one instant without rewriting them. That check is proposed in [#653](https://github.com/Cohexa-ai/agent-coherence/issues/653) and is not shipped.
 - **Recovery is the agent's.** Over MCP a refusal carries a `recover` verb and often a `next_step`, and in Python it is a typed exception ([MCP server](#stale-write-guard-fs-mcp-server)). The agent then re-reads, rebuilds its change and retries, and nothing here merges content or rebuilds a change for it. `CoherentVolume.write_cas` does retry inside the call, but each retry only runs your `make_content` again on the current bytes, so the rebuild is still your code ([details](#concurrent-writers-write_cas)).
 - **No verdict on the work.** It checks that what an agent read is still current. It does not judge whether the result is right or the task is done.
-- **Claude Code warns by default.** The Claude Code hooks deny a session whose copy of a file went stale only in strict mode, on the files you opt in ([details](#after-a-strict-mode-stale-deny)). By default, if the coordinator is overloaded or does not answer, the hook lets the call through, in strict mode too ([#223](https://github.com/Cohexa-ai/agent-coherence/issues/223)); for an Edit or Write sent to a running coordinator, it also tells the model the check did not run ([details](#when-a-claude-code-edit-gets-no-answer)). By default the hooks also do not settle two sessions editing one file at the same time: the later edit is admitted with a note ([details](#acquire-or-fail-on-pre-edit)).
+- **Claude Code warns by default.** The Claude Code hooks deny a session whose copy of a file went stale only in strict mode, on the files you opt in ([details](#after-a-strict-mode-stale-deny)). By default, if the coordinator is overloaded or does not answer, the hook lets the call through, in strict mode too ([#223](https://github.com/Cohexa-ai/agent-coherence/issues/223)); for an Edit or Write sent to a running coordinator, this package's hook client (`agent-coherence-hook-client`) also tells the model the check did not run, and the plugin's Node hook client does not ([details](#when-a-claude-code-edit-gets-no-answer)). By default the hooks also do not settle two sessions editing one file at the same time: the later edit is admitted with a note ([details](#acquire-or-fail-on-pre-edit)).
 - **Python, or MCP.** The library is Python 3.11+. An agent in another language reaches it through the [MCP server](#stale-write-guard-fs-mcp-server), or the [HTTP effect fence](#effect-fence-over-http) on the same host, and there is no TypeScript or Go SDK. The Claude Code plugin ships its own Node coordinator, which has no caller principals, sweep, snapshot sessions or handoffs ([details](#a-volume-on-the-node-coordinator)).
 - **`ccs-diagnose` only reports.** It observes one run of one LangGraph graph in one process and reports reads that were handed different versions. It denies no read and no write, and it cannot see divergence across separate OS processes ([reference](ccs-diagnose.md)).
 - **No dashboard.** Nothing here shows a running fleet: there is no web UI and no live chart of coordinator state. You read typed results and what the `agent-coherence-status` command prints for either coordinator ([status](#status-track-and-untrack-commands)), and `CCSStore` can send per-operation metrics to OpenTelemetry or LangSmith ([telemetry](#telemetry)). The pages and charts that exist are static files: an HTML report from `ccs-diagnose`, `ccs-simulate` or `ccs-compare`, and the benchmark curve that `tools/plot_cost_sweep.py` draws. Counters exist on the Python coordinator only: in `/status`, and in its `state.db`, which you read offline ([conflict-outcome counters](#conflict-outcome-counters--how-often-did-it-actually-fire), [foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)).
@@ -2755,14 +2755,13 @@ check times out (see [When the registry is busy](#when-the-registry-is-busy)).
 - A coordinator that exits while the request is under way gives the advisory,
   even when it stops cleanly: the check before the send cannot see an exit
   that comes after it.
-- The client waits up to 6 seconds for each request, and the first edit of a
-  new session sends two, the caller-principal claim and then the edit. So a
-  coordinator that accepts connections and never answers costs up to 12
-  seconds, and Claude Code's timeout for the hook must be longer than that
-  for the advisory to reach the model. A hook that Claude Code stops first
-  shows the model nothing.
-- Any failure to connect other than a refusal gives the advisory, a host out
-  of file descriptors included, so on such a host every edit carries it.
+- The client waits up to 6 seconds for each request. Until a claim of the
+  session's caller principal is confirmed, a hook sends two, the claim and then
+  its own request, and against a coordinator that accepts connections and
+  never answers no claim is ever confirmed. So there every edit costs up to 12
+  seconds, and Claude Code's timeout for the hook must be longer than that for
+  the advisory to reach the model. A hook that Claude Code stops first shows
+  the model nothing.
 - Nothing is retried
   ([#414](https://github.com/Cohexa-ai/agent-coherence/issues/414)).
 - Every other hook event (Read, Bash, Grep, the edit's PostToolUse, session
