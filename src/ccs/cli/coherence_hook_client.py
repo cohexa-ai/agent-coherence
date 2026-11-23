@@ -59,9 +59,11 @@ Exit code is always 0 on success — even if the coordinator returns
 
 When a request fails, the hook prints ``{}`` and the tool call proceeds, with
 one exception. A ``pre-edit`` sent to a running coordinator (one that holds
-the workspace lock) that gets no decision back — a 5xx status, or a
-connection that fails or times out any way but refused — prints a context-only
-advisory instead: ``hookSpecificOutput`` carrying
+the workspace lock) that gets no decision back — a 5xx status, the
+coordinator's 200 failure envelope (``ok: false`` with a reason starting
+``internal:``, meaning its handler raised before deciding), or a connection
+that fails or times out any way but refused — prints a context-only advisory
+instead: ``hookSpecificOutput`` carrying
 :data:`~ccs.adapters.claude_code.coordinator_server.DEGRADED_FRESHNESS_ADVISORY`
 and no ``permissionDecision``. The edit still proceeds, and the model is told
 the coherence check did not run. Nothing listening on the port, a refused or
@@ -126,6 +128,7 @@ from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.cli import _hook_on_held as on_held
 from ccs.cli._coherence_client import (
     SEND_ANSWERED,
+    SEND_HANDLER_FAILED,
     SEND_HTTP_UNANSWERED,
     SEND_TRANSPORT_UNANSWERED,
     CoordinatorEndpoint,
@@ -140,7 +143,7 @@ from ccs.cli._coherence_client import (
     workspace_relative,
 )
 from ccs.core.disk_spelling import LinkDoesNotResolve
-from ccs.core.exceptions import CallerPrincipalRefused, RedirectRefused
+from ccs.core.exceptions import CallerPrincipalRefused, RedirectRefused, _is_handler_failure_reason
 from ccs.core.path_fold import FoldProfile
 
 
@@ -364,18 +367,20 @@ def _call(
 
 
 # How a pre-edit ended when a coordinator holding the workspace lock was asked
-# and no decision came back: it answered a 5xx, or the request failed in
-# transport any way but a refused connection. The edit proceeds, and the model
-# is told the check did not run. Nothing listening, a refused or redirected
-# request, an empty or non-JSON 2xx answer and a refused principal print {}.
-_UNANSWERED = frozenset({SEND_HTTP_UNANSWERED, SEND_TRANSPORT_UNANSWERED})
+# and no decision came back: it answered a 5xx or its 200 failure envelope, or
+# the request failed in transport any way but a refused connection. The edit
+# proceeds, and the model is told the check did not run. Nothing listening, a
+# refused or redirected request, an empty or non-JSON 2xx answer and a refused
+# principal print {}.
+_UNANSWERED = frozenset({SEND_HTTP_UNANSWERED, SEND_TRANSPORT_UNANSWERED, SEND_HANDLER_FAILED})
 
 
 def _pre_edit_outcome(
     endpoint: CoordinatorEndpoint, payload: dict[str, Any], root: Path
 ) -> tuple[str, Optional[dict[str, Any]]]:
     """Send the pre-edit as :func:`_call` sends a request, and name how it
-    ended: ``answered`` with the coordinator's answer, or how it failed
+    ended: ``answered`` with the coordinator's answer, ``handler_failed`` when
+    that answer is its failure envelope, or how it failed
     (:func:`~ccs.cli._coherence_client.classify_send_failure`) with none.
 
     Its own path because :func:`_call` turns every refused status into
@@ -389,6 +394,10 @@ def _pre_edit_outcome(
             # The stderr line _call writes for it; stdout stays {}.
             _report(str(exc))
         return classify_send_failure(exc), None
+    if isinstance(answer, dict) and answer.get("ok") is False and _is_handler_failure_reason(answer.get("reason")):
+        # The coordinator's failure envelope: a 200, but its handler raised
+        # before deciding anything, the same envelope the volume refuses (#259).
+        return SEND_HANDLER_FAILED, answer
     return SEND_ANSWERED, answer
 
 

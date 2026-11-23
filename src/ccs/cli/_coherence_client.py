@@ -340,9 +340,13 @@ class CoordinatorMalformedAnswer(CoordinatorUnavailable):
 
 #: How a request to the coordinator ended. A published contract: a hook route
 #: decides what to print from these names, so they never change meaning.
-#: ``answered`` is the one a caller reports itself, for a 2xx JSON answer;
-#: :func:`classify_send_failure` returns one of the others for a failure.
+#: ``answered`` and ``handler_failed`` are the ones a caller reports itself,
+#: for a 2xx JSON answer: ``handler_failed`` when that answer is the
+#: coordinator's failure envelope (its handler raised, so nothing was decided),
+#: ``answered`` otherwise. :func:`classify_send_failure` returns one of the
+#: others for a failure.
 SEND_ANSWERED = "answered"
+SEND_HANDLER_FAILED = "handler_failed"
 SEND_HTTP_UNANSWERED = "http_unanswered"
 SEND_HTTP_REJECTED = "http_rejected"
 SEND_NO_LISTENER = "no_listener"

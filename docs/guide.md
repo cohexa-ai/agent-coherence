@@ -2740,7 +2740,8 @@ check times out (see [When the registry is busy](#when-the-registry-is-busy)).
 
 | What happened to the `pre-edit` | What the hook prints |
 |---|---|
-| The coordinator answered with a JSON object, an `internal:` failure answered `200` included | that answer, as before |
+| The coordinator answered with a JSON object, a refusal included | that answer, as before |
+| The coordinator answered `200` with its failure envelope, `{"ok": false, "reason": "internal: <type>"}`: its handler raised before deciding, as when its store stayed locked past its wait | the advisory |
 | HTTP `5xx`: every handler busy, a failure inside the coordinator (`500`), a coordinator stopping or draining for a migration (`503`) | the advisory |
 | The connection was reset or closed early, the answer was cut short, no answer came within the client's timeout, or the coordinator never accepted the connection | the advisory |
 | Nothing listens on the port (the connection is refused) | `{}` |
@@ -2750,8 +2751,8 @@ check times out (see [When the registry is busy](#when-the-registry-is-busy)).
 | The caller principal is refused and recovery cannot cure it | `{}`, with the stderr line it always wrote |
 
 - The advisory says the check "timed out under load" whichever of these
-  failures it reports: a `500`, a reset and a stopping coordinator get the
-  same words.
+  failures it reports: a `500`, a failure envelope, a reset and a stopping
+  coordinator get the same words.
 - A coordinator that exits while the request is under way gives the advisory,
   even when it stops cleanly: the check before the send cannot see an exit
   that comes after it.
@@ -5793,8 +5794,8 @@ with its own policy, and each bounds its wait in its own way:
 - **An edit the coordinator did not decide.** With the setting off, or for a
   file neither client counts as strict, this package's client prints the
   could-not-verify advisory for a `pre-edit` that a running coordinator
-  answered with a `5xx` or did not answer, and the Node hook client prints
-  `{}` (see [When a Claude Code edit gets no answer](#when-a-claude-code-edit-gets-no-answer)).
+  answered with a `5xx` or its failure envelope, or did not answer, and the
+  Node hook client does not (see [When a Claude Code edit gets no answer](#when-a-claude-code-edit-gets-no-answer)).
 - **Timing.** The Node hook client bounds the whole decision by one 5-second
   deadline, and this package's client gives each request its own 6-second
   timeout (see **When the coordinator does not answer** below).

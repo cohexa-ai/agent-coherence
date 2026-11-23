@@ -2278,6 +2278,7 @@ def test_a_principal_recovery_cannot_cure_denies_where_today_admits_silently(
 
 import select  # noqa: E402
 import socket  # noqa: E402
+import sqlite3  # noqa: E402
 import struct  # noqa: E402
 
 from ccs.adapters.claude_code.coordinator_server import DEGRADED_FRESHNESS_ADVISORY  # noqa: E402
@@ -2713,11 +2714,11 @@ def test_a_pre_edit_whose_route_fails_with_a_500_prints_the_advisory(
     _assert_advisory(done.stdout)
 
 
-def test_a_pre_edit_whose_handler_fails_inside_its_work_prints_the_internal_answer_as_today(
+def test_a_pre_edit_whose_handler_fails_inside_its_work_prints_the_advisory(
     slow_dropping_coordinator, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The coordinator answers an error inside the handler 200, as a refused
-    request, so it is a decision and is relayed verbatim."""
+    """The coordinator answers an error inside the handler with a 200 failure
+    envelope: the check raised, so no decision was made."""
     workspace, server = slow_dropping_coordinator
 
     def fail(**_kwargs: Any) -> None:
@@ -2726,8 +2727,65 @@ def test_a_pre_edit_whose_handler_fails_inside_its_work_prints_the_internal_answ
     monkeypatch.setattr(server.service, "record_heartbeat", fail)
     done = _run_hook_process(workspace)
 
-    internal = {"ok": False, "reason": f"{HANDLER_FAILURE_REASON_PREFIX}RuntimeError"}
-    assert (done.returncode, done.stdout, done.stderr) == (0, json.dumps(internal) + "\n", "")
+    assert (done.returncode, done.stderr) == (0, "")
+    _assert_advisory(done.stdout)
+
+
+def test_a_pre_edit_whose_store_stays_locked_past_its_busy_timeout_prints_the_advisory(
+    slow_dropping_coordinator,
+) -> None:
+    """An outside writer holds the store's write lock longer than the
+    coordinator waits for it, so the pre-edit's work raises and the
+    coordinator answers its failure envelope with a 200."""
+    workspace, _server = slow_dropping_coordinator
+    outside = sqlite3.connect(workspace / ".coherence" / "state.db", timeout=0, isolation_level=None)
+    try:
+        outside.execute("BEGIN IMMEDIATE")
+        endpoint = _coherence_client.resolve_endpoint(workspace)
+        control = _coherence_client.post(endpoint, _PRE_EDIT, {"session_id": _sid(), "path": "plan.md"})
+        done = _run_hook_process(workspace)
+    finally:
+        outside.close()
+
+    locked = {"ok": False, "reason": f"{HANDLER_FAILURE_REASON_PREFIX}OperationalError"}
+    assert control == locked, "control: the locked store fails the pre-edit's work"
+    assert (done.returncode, done.stderr) == (0, "")
+    _assert_advisory(done.stdout)
+
+
+def test_a_pre_edit_answered_with_the_failure_envelope_prints_the_advisory(hook: _Hook) -> None:
+    _default_workspace(hook)
+    envelope = {"ok": False, "reason": f"{HANDLER_FAILURE_REASON_PREFIX}RuntimeError"}
+    with _stub({_PRE_EDIT: _json_answer(envelope)})(hook):
+        out, err = hook.run(_edit_cc(hook.workspace, _sid()))
+
+    _assert_advisory(out)
+    assert err == ""
+
+
+_STALE_DENY = {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "plan.md changed since this session read it",
+}
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"ok": False, "reason": "other_holder", "holder_agent_id": "agent-other"},
+        {"ok": False, "reason": "stale_read", "hookSpecificOutput": _STALE_DENY},
+        {"ok": True, "reason": f"{HANDLER_FAILURE_REASON_PREFIX}RuntimeError"},
+        {"ok": False, "reason": "internal failure"},
+    ],
+    ids=["other-holder", "stale-deny", "ok-true-with-internal-reason", "reason-without-the-prefix"],
+)
+def test_a_pre_edit_answer_that_is_not_the_failure_envelope_prints_verbatim(hook: _Hook, answer: dict) -> None:
+    _default_workspace(hook)
+    with _stub({_PRE_EDIT: _json_answer(answer)})(hook):
+        out, err = hook.run(_edit_cc(hook.workspace, _sid()))
+
+    assert (out, err) == (json.dumps(answer) + "\n", "")
 
 
 def test_a_pre_edit_to_a_coordinator_draining_for_a_migration_prints_the_advisory(
