@@ -2266,3 +2266,456 @@ def test_a_principal_recovery_cannot_cure_denies_where_today_admits_silently(
     assert out == _unavailable()
     assert "caller principal refused" in err
     assert out_today == "{}\n"
+
+
+# ----------------------------------------------------------------------
+# A pre-edit the coordinator could not decide: the client prints the
+# could-not-verify advisory when a coordinator that holds the workspace lock
+# was expected to answer and no decision arrived (a 5xx, or a transport
+# failure), and {} when nobody was listening, the request was refused, or the
+# answer was not a JSON answer. Every other subcommand keeps today's bytes.
+# ----------------------------------------------------------------------
+
+import select  # noqa: E402
+import socket  # noqa: E402
+import struct  # noqa: E402
+
+from ccs.adapters.claude_code.coordinator_server import DEGRADED_FRESHNESS_ADVISORY  # noqa: E402
+
+_PRE_EDIT = "/hooks/pre-edit"
+_CLAIM = "/principal/claim"
+_ADVISORY_LINE = (
+    json.dumps({"hookSpecificOutput": hook_payloads.emit_pretooluse_context(additional_context=DEGRADED_FRESHNESS_ADVISORY)})
+    + "\n"
+)
+_UNAVAILABLE_BODY = b'{"error": "handler concurrency exceeded"}'
+
+
+def _assert_advisory(out: str) -> None:
+    """The exact advisory line, and nothing that could deny or allow the edit."""
+    assert out == _ADVISORY_LINE
+    printed = json.loads(out)
+    assert set(printed) == {"hookSpecificOutput"}
+    assert printed["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+    assert "permissionDecision" not in out
+
+
+def _default_workspace(hook: _Hook) -> None:
+    """Default configuration: no hold refusal, so only the plain pre-edit is sent."""
+    _strict_workspace(hook.workspace, setting=None)
+
+
+def test_a_pre_edit_the_coordinator_answers_503_prints_the_advisory(hook: _Hook) -> None:
+    _default_workspace(hook)
+    with _stub({_PRE_EDIT: _Answer(503, _UNAVAILABLE_BODY)})(hook) as seen:
+        out, err = hook.run(_edit_cc(hook.workspace, _sid()))
+
+    _assert_advisory(out)
+    assert err == ""
+    assert _routes(seen) == _TODAYS_ROUTES
+
+
+def test_a_fresh_session_whose_claim_and_pre_edit_both_get_503_prints_the_advisory(hook: _Hook) -> None:
+    _default_workspace(hook)
+    with _stub({_CLAIM: _Answer(503, _UNAVAILABLE_BODY), _PRE_EDIT: _Answer(503, _UNAVAILABLE_BODY)})(hook) as seen:
+        out, err = hook.run(_edit_cc(hook.workspace, _sid()))
+
+    _assert_advisory(out)
+    assert err == ""
+    assert _routes(seen) == _TODAYS_ROUTES
+
+
+def test_a_claim_that_gets_503_before_an_answered_pre_edit_passes_the_answer_through(hook: _Hook) -> None:
+    _default_workspace(hook)
+    with _stub({_CLAIM: _Answer(503, _UNAVAILABLE_BODY)})(hook):
+        out, err = hook.run(_edit_cc(hook.workspace, _sid()))
+
+    assert (out, err) == (_ADMIT_LINE, "")
+
+
+def test_a_principal_refusal_whose_recovery_claim_also_fails_prints_empty_and_reports_it(hook: _Hook) -> None:
+    """The claim's answer is lost, the pre-edit is refused for its missing
+    principal, and the recovery claim fails too: a refused principal prints {}
+    whatever its cause, with today's stderr line."""
+    _default_workspace(hook)
+    absent = _json_answer({"error": "x", "reason": "caller_principal_absent"}, status=400)
+    with _stub({_CLAIM: _Answer(503, _UNAVAILABLE_BODY), _PRE_EDIT: absent})(hook):
+        out, err = hook.run(_edit_cc(hook.workspace, _sid()))
+
+    assert out == "{}\n"
+    assert err.startswith("agent-coherence-hook-client: ") and "caller principal" in err
+
+
+def test_a_claim_refused_as_already_claimed_then_a_pre_edit_503_prints_the_advisory_and_todays_line(
+    hook: _Hook,
+) -> None:
+    _default_workspace(hook)
+    claimed = _json_answer({"ok": False, "reason": "caller_principal_claimed"})
+    with _stub({_CLAIM: claimed, _PRE_EDIT: _Answer(503, _UNAVAILABLE_BODY)})(hook):
+        out, err = hook.run(_edit_cc(hook.workspace, _sid()))
+
+    _assert_advisory(out)
+    assert err.startswith("agent-coherence-hook-client: caller principal refused: ")
+    assert "already bound under a different mint nonce" in err and err.count("\n") == 1
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [_Answer(body=b"null"), _Answer(302, b"{}"), _Answer(400, b'{"error": "bad"}'), _Answer(body=b"")],
+    ids=["json-null", "302", "400", "empty-200"],
+)
+def test_a_pre_edit_answered_with_no_decision_to_relay_prints_empty(hook: _Hook, answer: _Answer) -> None:
+    _default_workspace(hook)
+    with _stub({_PRE_EDIT: answer})(hook) as seen:
+        out, err = hook.run(_edit_cc(hook.workspace, _sid()))
+
+    assert (out, err) == ("{}\n", "")
+    assert _routes(seen) == _TODAYS_ROUTES
+
+
+def test_a_coordinator_replaced_between_the_claim_and_the_pre_edit_prints_empty_and_sends_nothing(
+    hook: _Hook,
+) -> None:
+    _default_workspace(hook)
+    pid_file = hook.workspace / ".coherence" / "server.pid"
+    replaced = _Answer(404, b"{}", before=lambda: pid_file.write_text("54321\n50001\n"))
+    with _stub({_CLAIM: replaced, _PRE_EDIT: _Answer(503, _UNAVAILABLE_BODY)})(hook) as seen:
+        out, err = hook.run(_edit_cc(hook.workspace, _sid()))
+
+    assert (out, err) == ("{}\n", "")
+    assert _routes(seen) == [("POST", _CLAIM)]
+
+
+def test_a_pre_edit_whose_payload_cannot_be_built_prints_empty_and_sends_nothing(hook: _Hook) -> None:
+    _default_workspace(hook)
+    with _stub({_PRE_EDIT: _Answer(503, _UNAVAILABLE_BODY)})(hook) as seen:
+        out, err = hook.run({"session_id": _sid(), "tool_name": "Edit", "tool_input": "x"})
+
+    assert (out, err) == ("{}\n", "")
+    assert seen == []
+
+
+def test_with_the_hold_refusal_on_a_strict_pre_edit_503_still_gets_the_unavailable_deny(hook: _Hook) -> None:
+    _strict_workspace(hook.workspace)
+    with _stub({_PRE_EDIT: _Answer(503, _UNAVAILABLE_BODY)})(hook):
+        out, err = hook.run(_edit_cc(hook.workspace, _sid()))
+
+    assert (out, err) == (_unavailable(), "")
+
+
+def test_with_the_hold_refusal_on_a_non_strict_pre_edit_503_prints_the_advisory(hook: _Hook) -> None:
+    _strict_workspace(hook.workspace)
+    with _stub({_PRE_EDIT: _Answer(503, _UNAVAILABLE_BODY)})(hook):
+        out, err = hook.run(_edit_cc(hook.workspace, _sid(), name="notes.md"))
+
+    _assert_advisory(out)
+    assert err == ""
+
+
+def _other_route_cc(workspace: Path, subcommand: str) -> dict[str, Any]:
+    sid = _sid()
+    file_input = {"file_path": str(workspace / "plan.md")}
+    return {
+        "pre-read": {"session_id": sid, "tool_name": "Read", "tool_input": file_input},
+        "post-edit": {"session_id": sid, "tool_name": "Edit", "tool_input": file_input},
+        "pre-bash": {"session_id": sid, "tool_name": "Bash", "tool_input": {"command": "cat plan.md"}},
+        "pre-grep": {"session_id": sid, "tool_name": "Grep", "tool_input": {"pattern": "v1", "path": str(workspace)}},
+        "session-start": {"session_id": sid, "source": "compact"},
+        "session-stop": {"session_id": sid},
+        "subagent-stop": {"session_id": sid, "agent_id": "agent-1"},
+    }[subcommand]
+
+
+_OTHER_ROUTES = {
+    "pre-read": "/hooks/pre-read",
+    "post-edit": "/hooks/post-edit",
+    "pre-bash": "/hooks/pre-bash",
+    "pre-grep": "/hooks/pre-grep",
+    "session-start": "/hooks/session-start",
+    "session-stop": "/hooks/session-stop",
+    "subagent-stop": "/hooks/session-stop",
+}
+
+
+@pytest.mark.parametrize("subcommand", sorted(_OTHER_ROUTES))
+def test_every_other_subcommand_still_prints_empty_when_its_route_gets_503(hook: _Hook, subcommand: str) -> None:
+    _default_workspace(hook)
+    route = _OTHER_ROUTES[subcommand]
+    with _stub({route: _Answer(503, _UNAVAILABLE_BODY)})(hook) as seen:
+        out, err = hook.run(_other_route_cc(hook.workspace, subcommand), subcommand)
+
+    assert (out, err) == ("{}\n", "")
+    assert ("POST", route) in _routes(seen), "control: the route was asked"
+
+
+# The client as Claude Code runs it, a separate process, against a raw socket
+# that fails each way a busy, crashed or stopped coordinator can. The timeout
+# is shrunk through the module global the client reads per request.
+_SHIM = (
+    "import sys\n"
+    "from ccs.cli import _coherence_client\n"
+    "_coherence_client.CLI_HTTP_TIMEOUT_SEC = float(sys.argv[1])\n"
+    "from ccs.cli.coherence_hook_client import main\n"
+    "sys.exit(main(sys.argv[2:]))\n"
+)
+
+
+def _run_hook_process(workspace: Path, timeout_sec: float = 3.0) -> subprocess.CompletedProcess[str]:
+    cc = _edit_cc(workspace, _sid())
+    return subprocess.run(
+        [sys.executable, "-c", _SHIM, str(timeout_sec), "pre-edit", "--root", str(workspace)],
+        input=json.dumps(cc), capture_output=True, text=True, timeout=120,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+    )
+
+
+def _read_whole_request(conn: socket.socket) -> None:
+    conn.settimeout(5)
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = conn.recv(65536)
+        if not chunk:
+            return
+        data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    length = next((int(line.split(b":")[1]) for line in head.split(b"\r\n") if line.lower().startswith(b"content-length:")), 0)
+    while len(body) < length and (chunk := conn.recv(65536)):
+        body += chunk
+
+
+def _status(code: int) -> Callable[[socket.socket], None]:
+    def act(conn: socket.socket) -> None:
+        body = b'{"error": "x"}'
+        conn.sendall(b"HTTP/1.1 %d X\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (code, len(body), body))
+
+    return act
+
+
+def _reset_conn(conn: socket.socket) -> None:
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+
+
+@contextmanager
+def _raw_coordinator(workspace: Path, act: Callable[[socket.socket], None], *, read_first: bool = True) -> Iterator[None]:
+    """Every connection is read (or not), handed to ``act``, then closed. The
+    test holds the workspace lock, so the client sees a running coordinator."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    stop = threading.Event()
+
+    def serve() -> None:
+        while not stop.is_set():
+            if not select.select([listener], [], [], 0.05)[0]:
+                continue
+            conn, _ = listener.accept()
+            try:
+                if read_first:
+                    _read_whole_request(conn)
+                act(conn)
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        _fake_coherence_dir(workspace, port=listener.getsockname()[1])
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=10)
+        listener.close()
+
+
+@pytest.mark.parametrize(
+    ("act", "read_first"),
+    [
+        (_status(503), True),
+        (_status(503), False),
+        (_reset_conn, True),
+        (_reset_conn, False),
+        (_status(500), True),
+    ],
+    ids=["read-then-503", "503-before-reading", "reset-after-read", "reset-on-accept", "read-then-500"],
+)
+def test_a_hook_process_whose_coordinator_cannot_answer_prints_the_advisory(
+    git_workspace: Path, act: Callable[[socket.socket], None], read_first: bool,
+) -> None:
+    _strict_workspace(git_workspace, setting=None)
+    with _raw_coordinator(git_workspace, act, read_first=read_first):
+        done = _run_hook_process(git_workspace)
+
+    assert done.returncode == 0
+    _assert_advisory(done.stdout)
+    assert done.stderr == ""
+
+
+def test_a_hook_process_whose_coordinator_accepts_and_never_answers_prints_the_advisory(git_workspace: Path) -> None:
+    """The claim and the pre-edit each wait out the client's timeout."""
+    _strict_workspace(git_workspace, setting=None)
+    hold = threading.Event()
+    started = time.monotonic()
+    try:
+        with _raw_coordinator(git_workspace, lambda conn: hold.wait(10)):
+            done = _run_hook_process(git_workspace, timeout_sec=0.5)
+    finally:
+        hold.set()
+
+    assert done.returncode == 0
+    _assert_advisory(done.stdout)
+    assert done.stderr == ""
+    assert time.monotonic() - started >= 1.0, "control: both requests waited out the timeout"
+
+
+def test_a_hook_process_whose_pre_edit_is_rejected_400_prints_empty(git_workspace: Path) -> None:
+    _strict_workspace(git_workspace, setting=None)
+    with _raw_coordinator(git_workspace, _status(400)):
+        done = _run_hook_process(git_workspace)
+
+    assert (done.returncode, done.stdout, done.stderr) == (0, "{}\n", "")
+
+
+def test_a_hook_process_with_nothing_listening_on_the_port_prints_empty(git_workspace: Path) -> None:
+    from tests.loopback_helpers import refusing_port
+
+    _strict_workspace(git_workspace, setting=None)
+    _fake_coherence_dir(git_workspace, port=refusing_port())
+    done = _run_hook_process(git_workspace)
+
+    assert (done.returncode, done.stdout, done.stderr) == (0, "{}\n", "")
+
+
+def test_a_hook_process_with_a_port_less_pid_file_prints_empty(git_workspace: Path) -> None:
+    from tests.pid_lock_helpers import hold_coordinator_lock
+
+    _strict_workspace(git_workspace, setting=None)
+    pid_file = git_workspace / ".coherence" / "server.pid"
+    pid_file.write_text("12345\n")
+    hold_coordinator_lock(pid_file)
+    done = _run_hook_process(git_workspace)
+
+    assert (done.returncode, done.stdout, done.stderr) == (0, "{}\n", "")
+
+
+# The same advisory from a real coordinator, the way it fails in use: every
+# handler slot taken, a route that fails with a 500, and a coordinator draining
+# for a migration. An error inside the pre-edit handler is answered 200 and
+# passed through as today.
+from ccs.adapters.claude_code import coordinator_server  # noqa: E402
+from ccs.adapters.claude_code.coordinator_server import HANDLER_CONCURRENCY_LIMIT  # noqa: E402
+from ccs.core.exceptions import HANDLER_FAILURE_REASON_PREFIX  # noqa: E402
+
+
+@pytest.fixture
+def slow_dropping_coordinator(git_workspace: Path, monkeypatch: pytest.MonkeyPatch):
+    """A coordinator in this process whose handlers wait 30 s for a silent
+    connection's request, so idle sockets hold their handler slots while hook
+    processes run. Its handler class reads the read timeout when the server is
+    built."""
+    _strict_workspace(git_workspace, setting=None)
+    monkeypatch.setattr(coordinator_server, "HANDLER_READ_TIMEOUT_SEC", 30.0)
+    server = CoordinatorHTTPServer(git_workspace, port=0, instance_id="hook-advisory")
+    server.serve_in_thread()
+    write_coordinator_pid_file(git_workspace / ".coherence", server.port, pid=os.getpid())
+    try:
+        yield git_workspace, server
+    finally:
+        server.shutdown()
+
+
+def _slots_in_use(server: CoordinatorHTTPServer) -> int:
+    return HANDLER_CONCURRENCY_LIMIT - server._server._concurrency_sem._value
+
+
+def _eventually(holds: Callable[[], bool], budget_sec: float = 10.0) -> bool:
+    deadline = time.monotonic() + budget_sec
+    while not holds():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.002)
+    return True
+
+
+@contextmanager
+def _every_handler_slot_held(server: CoordinatorHTTPServer) -> Iterator[None]:
+    """Idle connections holding every handler slot. Each is opened once the
+    last holds its slot, so filling them does not depend on the listen
+    backlog."""
+    idle: list[socket.socket] = []
+    try:
+        for opened in range(1, HANDLER_CONCURRENCY_LIMIT + 1):
+            idle.append(socket.create_connection(("127.0.0.1", server.port)))
+            assert _eventually(lambda: _slots_in_use(server) >= opened), "the idle sockets never filled the slots"
+        yield
+    finally:
+        for sock in idle:
+            sock.close()
+
+
+def test_a_pre_edit_to_a_coordinator_with_every_handler_slot_taken_prints_the_advisory_every_run(
+    slow_dropping_coordinator,
+) -> None:
+    """The coordinator turns the hook away before reading it, with a 503 or a
+    reset; either is the advisory. Once the slots are free the next pre-edit
+    gets the coordinator's own answer."""
+    workspace, server = slow_dropping_coordinator
+    turned_away = server._server.handler_concurrency_overflows_total
+    with _every_handler_slot_held(server):
+        runs = [_run_hook_process(workspace) for _ in range(5)]
+        assert _slots_in_use(server) == HANDLER_CONCURRENCY_LIMIT, "control: the slots stayed taken"
+    assert server._server.handler_concurrency_overflows_total > turned_away, "control: the hooks were turned away"
+
+    for done in runs:
+        assert (done.returncode, done.stderr) == (0, "")
+        _assert_advisory(done.stdout)
+    assert _eventually(lambda: _slots_in_use(server) == 0), "a closed connection kept its slot"
+    after = _run_hook_process(workspace)
+    assert after.stdout != _ADVISORY_LINE and json.loads(after.stdout)["ok"] is True
+
+
+def test_a_pre_edit_whose_route_fails_with_a_500_prints_the_advisory(
+    slow_dropping_coordinator, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, _server = slow_dropping_coordinator
+    asked: list[str] = []
+
+    def fail(_req: Any, _coordinator: Any) -> None:
+        asked.append("pre-edit")
+        raise RuntimeError("simulated route failure")
+
+    monkeypatch.setitem(coordinator_server._ROUTES, ("POST", _PRE_EDIT), fail)
+    done = _run_hook_process(workspace)
+
+    assert asked == ["pre-edit"], "control: the failing route was asked"
+    assert (done.returncode, done.stderr) == (0, "")
+    _assert_advisory(done.stdout)
+
+
+def test_a_pre_edit_whose_handler_fails_inside_its_work_prints_the_internal_answer_as_today(
+    slow_dropping_coordinator, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The coordinator answers an error inside the handler 200, as a refused
+    request, so it is a decision and is relayed verbatim."""
+    workspace, server = slow_dropping_coordinator
+
+    def fail(**_kwargs: Any) -> None:
+        raise RuntimeError("simulated handler failure")
+
+    monkeypatch.setattr(server.service, "record_heartbeat", fail)
+    done = _run_hook_process(workspace)
+
+    internal = {"ok": False, "reason": f"{HANDLER_FAILURE_REASON_PREFIX}RuntimeError"}
+    assert (done.returncode, done.stdout, done.stderr) == (0, json.dumps(internal) + "\n", "")
+
+
+def test_a_pre_edit_to_a_coordinator_draining_for_a_migration_prints_the_advisory(
+    slow_dropping_coordinator, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, server = slow_dropping_coordinator
+    monkeypatch.setattr(server, "_migration_draining", True)
+    done = _run_hook_process(workspace)
+
+    assert (done.returncode, done.stderr) == (0, "")
+    _assert_advisory(done.stdout)

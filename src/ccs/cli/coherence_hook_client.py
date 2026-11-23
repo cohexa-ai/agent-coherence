@@ -57,6 +57,18 @@ Exit code is always 0 on success — even if the coordinator returns
 ``ok: False``, that's a logical outcome surfaced to the model via
 ``additionalContext``, not a hook failure.
 
+When a request fails, the hook prints ``{}`` and the tool call proceeds, with
+one exception. A ``pre-edit`` sent to a running coordinator (one that holds
+the workspace lock) that gets no decision back — a 5xx status, or a
+connection that fails or times out any way but refused — prints a context-only
+advisory instead: ``hookSpecificOutput`` carrying
+:data:`~ccs.adapters.claude_code.coordinator_server.DEGRADED_FRESHNESS_ADVISORY`
+and no ``permissionDecision``. The edit still proceeds, and the model is told
+the coherence check did not run. Nothing listening on the port, a refused or
+redirected request, an empty or non-JSON answer and a refused caller principal
+print ``{}``, as does any failure on the other subcommands. Nothing is
+retried.
+
 ## Caller principal
 
 Every request presents the session's caller principal in the
@@ -107,13 +119,19 @@ import urllib.error
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+from ccs.adapters.claude_code.coordinator_server import DEGRADED_FRESHNESS_ADVISORY
+from ccs.adapters.claude_code.hook_payloads import emit_pretooluse_context
 from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.cli import _hook_on_held as on_held
 from ccs.cli._coherence_client import (
+    SEND_ANSWERED,
+    SEND_HTTP_UNANSWERED,
+    SEND_TRANSPORT_UNANSWERED,
     CoordinatorEndpoint,
     CoordinatorPortUnknown,
     CoordinatorUnavailable,
+    classify_send_failure,
     err,
     get,
     post,
@@ -122,7 +140,7 @@ from ccs.cli._coherence_client import (
     workspace_relative,
 )
 from ccs.core.disk_spelling import LinkDoesNotResolve
-from ccs.core.exceptions import CallerPrincipalRefused
+from ccs.core.exceptions import CallerPrincipalRefused, RedirectRefused
 from ccs.core.path_fold import FoldProfile
 
 
@@ -245,7 +263,9 @@ def _main_inner(argv: Sequence[str] | None = None) -> int:
             response = _call(endpoint, "/hooks/pre-read", payload, root_path)
         elif args.subcommand == "pre-edit":
             payload = _build_pre_edit(cc_payload, root_path)
-            response = _call(endpoint, "/hooks/pre-edit", payload, root_path)
+            outcome, response = _pre_edit_outcome(endpoint, payload, root_path)
+            if outcome in _UNANSWERED:
+                response = _could_not_verify()
         elif args.subcommand == "post-edit":
             payload = _build_post_edit(cc_payload, root_path)
             response = _call(endpoint, "/hooks/post-edit", payload, root_path)
@@ -335,9 +355,47 @@ def _call(
         _report(str(exc))
         return None
     except urllib.error.HTTPError:
-        # Coordinator rejected the request (validation error). Degrade
-        # silently — the hook should NEVER block the user's tool call.
+        # Any other status, a 5xx included, prints {} on these routes: the
+        # hook must never block the tool call. Only a pre-edit tells the model
+        # a check did not run (see _pre_edit_outcome).
         return None
+
+
+# How a pre-edit ended when a coordinator holding the workspace lock was asked
+# and no decision came back: it answered a 5xx, or the request failed in
+# transport any way but a refused connection. The edit proceeds, and the model
+# is told the check did not run. Nothing listening, a refused or redirected
+# request, an empty or non-JSON answer and a refused principal print {}.
+_UNANSWERED = frozenset({SEND_HTTP_UNANSWERED, SEND_TRANSPORT_UNANSWERED})
+
+
+def _pre_edit_outcome(
+    endpoint: CoordinatorEndpoint, payload: dict[str, Any], root: Path
+) -> tuple[str, Optional[dict[str, Any]]]:
+    """Send the pre-edit as :func:`_call` sends a request, and name how it
+    ended: ``answered`` with the coordinator's answer, or how it failed
+    (:func:`~ccs.cli._coherence_client.classify_send_failure`) with none.
+
+    Its own path because :func:`_call` turns every refused status into
+    ``None``, after which a 503 and a 400 look the same."""
+    try:
+        answer = post_with_stored_principal(
+            endpoint, root, "/hooks/pre-edit", payload, report=_report, send=post
+        )
+    except (CoordinatorUnavailable, CallerPrincipalRefused, RedirectRefused, urllib.error.HTTPError) as exc:
+        if isinstance(exc, CallerPrincipalRefused):
+            # The stderr line _call writes for it; stdout stays {}.
+            _report(str(exc))
+        return classify_send_failure(exc), None
+    return SEND_ANSWERED, answer
+
+
+def _could_not_verify() -> dict[str, Any]:
+    """What a pre-edit prints when no decision came back: context only, never a
+    ``permissionDecision``, so Claude Code's own permission prompt still
+    decides the edit. The words are the ones the coordinator uses when it
+    cannot decide a request in time."""
+    return {"hookSpecificOutput": emit_pretooluse_context(additional_context=DEGRADED_FRESHNESS_ADVISORY)}
 
 
 # A pre-edit payload and the fold profiles under which its path is strict.
