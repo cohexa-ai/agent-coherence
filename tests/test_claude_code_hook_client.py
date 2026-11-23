@@ -2373,6 +2373,24 @@ def test_a_pre_edit_answered_with_no_decision_to_relay_prints_empty(hook: _Hook,
     assert _routes(seen) == _TODAYS_ROUTES
 
 
+def test_a_pre_edit_retried_after_principal_recovery_that_gets_503_prints_the_advisory(hook: _Hook) -> None:
+    """The pre-edit is refused for its missing principal, recovery claims
+    again, and the one retry gets a 503: the retry's failure is the outcome."""
+    _default_workspace(hook)
+    answers = {_STATUS: _REFUSES}
+    answers[_PRE_EDIT] = _Answer(
+        400,
+        json.dumps({"error": "x", "reason": "caller_principal_absent"}).encode(),
+        before=lambda: answers.update({_PRE_EDIT: _Answer(503, _UNAVAILABLE_BODY)}),
+    )
+    with _scripted_coordinator(hook.workspace, answers) as seen:
+        out, err = hook.run(_edit_cc(hook.workspace, _sid()))
+
+    _assert_advisory(out)
+    assert err == ""
+    assert _routes(seen) == [("POST", _CLAIM), ("POST", _PRE_EDIT), ("POST", _CLAIM), ("POST", _PRE_EDIT)]
+
+
 def test_a_coordinator_replaced_between_the_claim_and_the_pre_edit_prints_empty_and_sends_nothing(
     hook: _Hook,
 ) -> None:
@@ -2553,20 +2571,22 @@ def test_a_hook_process_whose_coordinator_cannot_answer_prints_the_advisory(
 
 
 def test_a_hook_process_whose_coordinator_accepts_and_never_answers_prints_the_advisory(git_workspace: Path) -> None:
-    """The claim and the pre-edit each wait out the client's timeout."""
+    """The claim and the pre-edit each wait out the client's timeout. The
+    listener is released before its teardown joins the thread serving it."""
     _strict_workspace(git_workspace, setting=None)
     hold = threading.Event()
-    started = time.monotonic()
-    try:
-        with _raw_coordinator(git_workspace, lambda conn: hold.wait(10)):
-            done = _run_hook_process(git_workspace, timeout_sec=0.5)
-    finally:
-        hold.set()
+    with _raw_coordinator(git_workspace, lambda conn: hold.wait(10)):
+        try:
+            started = time.monotonic()
+            done = _run_hook_process(git_workspace, timeout_sec=1.0)
+            elapsed = time.monotonic() - started
+        finally:
+            hold.set()
 
     assert done.returncode == 0
     _assert_advisory(done.stdout)
     assert done.stderr == ""
-    assert time.monotonic() - started >= 1.0, "control: both requests waited out the timeout"
+    assert elapsed >= 2.0, "control: both requests waited out the timeout"
 
 
 def test_a_hook_process_whose_pre_edit_is_rejected_400_prints_empty(git_workspace: Path) -> None:
