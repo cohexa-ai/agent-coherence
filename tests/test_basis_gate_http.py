@@ -845,6 +845,19 @@ def test_a_commit_on_a_target_outside_the_basis_moves_only_the_target(desk: _Pla
     assert (_version(desk, _PATH), _version(desk, "spec.md")) == (2, 1)
 
 
+def test_a_target_spelling_a_member_another_way_commits_as_that_member(desk: _PlanDesk) -> None:
+    """A target that re-spells a basis member (``./plan.md`` for ``plan.md``)
+    at the member's version and registration is that member: the commit wins
+    under the member's own path, never an outcome-unknown hold."""
+    who = _claimed(desk.client)
+    plan = _recorded(desk, who, _PATH)
+
+    answer = _commit(desk, who, [plan], {**plan, "path": f"./{_PATH}"})
+
+    assert answer == {"answer": "proceed", "committed": {"path": _PATH, "version": 2}}
+    assert _version(desk, _PATH) == 2
+
+
 def test_a_commit_win_carries_the_handoff_key(desk: _PlanDesk) -> None:
     """The successor's win on a path handed to it completes the record, and
     the answer carries the ``handoff`` key a compare-and-swap win carries."""

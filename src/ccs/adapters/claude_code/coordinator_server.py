@@ -3873,7 +3873,9 @@ def _read_basis_target(
 ) -> _ReadMember | str:
     """The commit's target, or the 400 text. A target that names a member
     must be that member: the same file, version and registration, so one row
-    never carries two comparands."""
+    never carries two comparands. An agreeing target is answered as the
+    member itself, whatever spelling it used, so the service sees the very
+    member it compares."""
     target = _read_basis_member(raw, coordinator, "target")
     if isinstance(target, str):
         return target
@@ -3885,7 +3887,7 @@ def _read_basis_target(
         described_name.kind, described_name.key, described.version, described.registration,
     ):
         return "target names a basis member but disagrees with its path, version or registration"
-    return target
+    return named[0]
 
 
 def _commit_hash_error(content_hash: object) -> str | None:

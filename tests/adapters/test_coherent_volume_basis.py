@@ -813,6 +813,41 @@ def test_commit_if_basis_writes_nothing_when_an_input_moved(
     assert recorded_version(server, _OUT) == out.version
 
 
+def test_a_held_commit_on_a_target_never_read_leaves_a_baseline_that_guards_write(
+    volumes: VolumeFactory, tmp_path: Path,
+) -> None:
+    """A commit on a target this volume never read gives it the disk baseline
+    a later ``write()`` checks, so a hold does not leave ``write()`` free to
+    overwrite an edit made outside the coordinator afterwards."""
+    vol, peer = volumes(), volumes()
+    _data, member = vol.read_for_basis(_A)
+    peer.read(_OUT)  # registered, but never read by ``vol``
+    peer.write(_A, b"a2")
+
+    answer = vol.commit_if_basis([member], _OUT, 1, b"out2")
+
+    assert answer.answer == "hold"
+    assert _baseline(vol, _OUT) == _sha(b"out1")
+    _seed(tmp_path, _OUT, b"foreign")
+    with pytest.raises(StaleView):
+        vol.write(_OUT, b"mine")
+    assert (tmp_path / _OUT).read_bytes() == b"foreign"
+
+
+def test_a_commit_keeps_a_targets_existing_baseline(volumes: VolumeFactory, tmp_path: Path) -> None:
+    """A target this volume already read keeps the baseline that read
+    recorded: the commit does not re-take it from a disk edited since."""
+    vol, peer = volumes(), volumes()
+    _data, member = vol.read_for_basis(_A)
+    vol.read_for_basis(_OUT)
+    peer.write(_A, b"a2")
+    _seed(tmp_path, _OUT, b"foreign")
+
+    vol.commit_if_basis([member], _OUT, 1, b"out2")
+
+    assert _baseline(vol, _OUT) == _sha(b"out1")
+
+
 def test_commit_if_basis_writes_nothing_while_a_peer_holds_the_target(
     server: CoordinatorHTTPServer, volumes: VolumeFactory, tmp_path: Path,
 ) -> None:
