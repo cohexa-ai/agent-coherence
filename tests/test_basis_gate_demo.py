@@ -47,3 +47,19 @@ def test_basis_gate_demo_exits_one_when_the_check_proceeds_on_moved_inputs(
     monkeypatch.setattr(CoherentVolume, "check_basis", _always_proceeds)
 
     assert main(["--runs", "1"]) == 1
+
+
+@_SCRIPTS
+@pytest.mark.parametrize("runs", ["0", "-3", "two"])
+def test_basis_gate_demo_refuses_a_run_count_below_one_before_any_run(
+    script: str, runs: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    main = importlib.import_module(script).main
+
+    with pytest.raises(SystemExit) as refused:
+        main(["--runs", runs])
+
+    assert refused.value.code == 2
+    streams = capsys.readouterr()
+    assert "--runs" in streams.err
+    assert streams.out == ""

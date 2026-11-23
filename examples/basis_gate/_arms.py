@@ -276,9 +276,21 @@ ARMS: tuple[Arm, ...] = (
 )
 
 
+def _run_count(text: str) -> int:
+    """A ``--runs`` value: a whole number of at least 1, refused before any
+    coordinator starts, since a report with no runs has nothing to show."""
+    try:
+        runs = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number, got {text!r}") from None
+    if runs < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {runs}")
+    return runs
+
+
 def parse_runs(argv: list[str] | None, description: str) -> int:
     parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--runs", type=int, default=5, help="runs per arm (default 5)")
+    parser.add_argument("--runs", type=_run_count, default=5, help="runs per arm, at least 1 (default 5)")
     return parser.parse_args(argv).runs
 
 
