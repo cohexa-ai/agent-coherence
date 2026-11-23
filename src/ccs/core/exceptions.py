@@ -16,6 +16,13 @@ from uuid import UUID
 # reword on one side would otherwise silently break the other's retry routing.
 OCC_CALLER_TRANSIENT_REASON = "caller_in_transient_state"
 
+# The caller itself already holds the artifact EXCLUSIVE or MODIFIED, so the
+# compare-and-swap refuses it: that commit form is for a shared or invalid
+# holder, and an exclusive holder commits with the pessimistic verb. The
+# service has always put this token inside a refusal's prose message; it is a
+# constant so the basis commit's target block carries it as a typed value.
+OCC_IS_SHARED_OR_INVALID_ONLY_REASON = "occ_is_shared_or_invalid_only"
+
 # Read-generation fence (Piece #2): the reason a commit is rejected because the
 # committer's read_generation is older than the artifact's current
 # owner_generation -- its captured claim was superseded by a sweep reclamation.
@@ -93,6 +100,30 @@ HOLD_REASONS: frozenset[str] = frozenset(
         HOLD_GENERATION_UNCONFIRMED,
     }
 )
+
+# Basis-check hold reasons. A basis check holds for the five reasons below; the
+# fence's three are reused by value (one string, one meaning), and the two new
+# ones say the member's path no longer names the thing that was read:
+# ``basis_member_unmanaged`` (the path is now outside the managed set) and
+# ``basis_member_replaced`` (the record was deleted and registered again, so a
+# version number alone no longer identifies what was read). Kept apart from
+# HOLD_REASONS because the fence's closed set is a wire contract of its own.
+BASIS_MEMBER_UNMANAGED = "basis_member_unmanaged"
+BASIS_MEMBER_REPLACED = "basis_member_replaced"
+
+BASIS_HOLD_REASONS: frozenset[str] = frozenset(
+    {
+        HOLD_VERSION_MOVED,
+        HOLD_INPUT_VANISHED,
+        HOLD_VERSION_UNCONFIRMED,
+        BASIS_MEMBER_UNMANAGED,
+        BASIS_MEMBER_REPLACED,
+    }
+)
+"""The closed set a basis check answers with. ``input_vanished`` here excludes a
+path that is untracked by policy: the fence folds that case into it, a basis
+check reports it as ``basis_member_unmanaged`` because the caller's remedy
+differs (the path left the managed set, it did not disappear)."""
 
 # ---------------------------------------------------------------------------
 # read-at-version rejection vocabulary (plan item N v1, Unit 4 / R5)
@@ -1526,6 +1557,14 @@ class RefuseModeUnsupported(CoherenceError):
     :class:`CoherenceError`, so every handler of that still catches it; a
     ``/status`` read that got no answer raises :class:`CoordinatorUnreachable`
     instead. Message only, so it pickles whole across a process boundary."""
+
+
+class BasisCheckAbsent(CoherenceError):
+    """The coordinator in use does not serve the basis routes: the Node
+    coordinator, or a Python coordinator older than the routes. A basis check
+    or a commit under a basis cannot be answered, and silence is never taken for
+    unchanged, so the caller must run a Python coordinator that serves them.
+    Message only, so it pickles whole across a process boundary."""
 
 
 class PublishMaterializationError(CoherenceError):

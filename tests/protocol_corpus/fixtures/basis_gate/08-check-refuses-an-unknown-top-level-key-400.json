@@ -1,0 +1,35 @@
+{
+  "name": "basis-check-refuses-an-unknown-top-level-key-400",
+  "description": "CLIENT ERROR. A key the route does not define is refused with 400, never answered as a hold: a hold would tell a caller its inputs moved when the request was merely malformed.",
+  "setup": {
+    "tracked": [
+      "docs/**"
+    ],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n"
+    }
+  },
+  "request": {
+    "method": "POST",
+    "path": "/basis/check",
+    "body": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "basis": [
+        {
+          "path": "docs/plan.md",
+          "version": 1
+        }
+      ],
+      "mode": "lenient"
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": "unknown field 'mode'"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

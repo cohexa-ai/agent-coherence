@@ -333,6 +333,9 @@ def test_refusal_reasons_are_distinct_and_never_a_hold() -> None:
     }
     assert len(CALLER_PRINCIPAL_REASONS) == 3
     assert CALLER_PRINCIPAL_REASONS.isdisjoint(HOLD_REASONS)
+    assert CALLER_PRINCIPAL_REASONS.isdisjoint(
+        {"basis_member_unmanaged", "basis_member_replaced", "occ_is_shared_or_invalid_only"}
+    )
 
 
 def test_a_route_refusal_carries_exactly_the_two_route_reasons() -> None:

@@ -22,6 +22,7 @@ from typing import (
 )
 from uuid import UUID, uuid4
 
+from ccs.core.basis import canonical_registration
 from ccs.core.exceptions import (
     STALE_READ_GENERATION_REASON,
     UNKNOWN_ARTIFACT_REASON,
@@ -50,6 +51,9 @@ from .registry_protocol import (
     HANDOFF_TRIGGER,
     RECLAIM_TRIGGERS,  # noqa: F401 — re-exported; see the parity test
     SWEEP_RECLAIM_TRIGGERS,
+    BasisCasResult,
+    BasisMoved,
+    BasisRow,
     CaptureResult,
     CasResult,
     CheckpointMember,
@@ -62,10 +66,13 @@ from .registry_protocol import (
     TransferRequest,
     UncoverableRun,
     acquire_by_deadline,
+    basis_comparands,
     decide_transfer_grant,
     forget_refusal,
+    moved_basis_ids,
     note_guard_won,
     refusal_with_generation_pair,
+    require_basis_bindable,
     require_storable_transfer_status,
     transfer_record_live,
 )
@@ -131,6 +138,12 @@ class ArtifactRecord:
     # never liveness: liveness is read against ``artifact.version``
     # (``ArtifactRegistry._transfer_read``).
     transfer: TransferRecord | None = None
+    # The registration a basis records: a fresh token for every record, so
+    # every ``register_artifact`` mints one, including one that replaces a live
+    # record under the same id. CCSStore re-registers a deleted key under its
+    # deterministic id, so the id alone cannot tell the record a caller read
+    # from the one registered in its place; the token can.
+    registration: str = field(default_factory=lambda: str(uuid4()))
 
 
 def _forget_on_record(record: ArtifactRecord, agent_id: UUID) -> int:
@@ -389,7 +402,10 @@ class ArtifactRegistry:
         (Unit 2): a concurrent ``capture_version_vector`` reads N artifact
         versions + inserts the pin set under that same lock, so registering /
         moving a version cannot interleave a multi-artifact capture and tear its
-        cut (read skew)."""
+        cut (read skew).
+
+        Every call builds a new record, so the record carries a new
+        registration even when it replaces a live one under the same id."""
         with self._lock:
             record = ArtifactRecord(artifact=artifact, content=content)
             if self._retain_versions:
@@ -405,6 +421,28 @@ class ArtifactRegistry:
         """Return all known artifact ids."""
         with self._lock:
             return list(self._records.keys())
+
+    def basis_rows(
+        self, registrations: Iterable[str | UUID], names: Iterable[str]
+    ) -> list[BasisRow]:
+        """See :meth:`RegistryBase.basis_rows`: one scan of the records under
+        one hold of the lock, matching each record's registration token or its
+        exact name."""
+        wanted_registrations = {canonical_registration(r) for r in registrations}
+        wanted_names = set(names)
+        require_basis_bindable(len(wanted_registrations) + len(wanted_names))
+        with self._lock:
+            return [
+                BasisRow(
+                    artifact_id=artifact_id,
+                    name=record.artifact.name,
+                    version=record.artifact.version,
+                    registration=record.registration,
+                )
+                for artifact_id, record in self._records.items()
+                if record.registration in wanted_registrations
+                or record.artifact.name in wanted_names
+            ]
 
     def get_artifact(self, artifact_id: UUID) -> Optional[Artifact]:
         """Return artifact metadata if present."""
@@ -1086,6 +1124,51 @@ class ArtifactRegistry:
             record.last_observed_version_by_agent[agent_id] = next_version
 
             return updated, invalidated
+
+    def commit_cas_if_basis(
+        self,
+        basis: Mapping[UUID, int],
+        artifact_id: UUID,
+        agent_id: UUID,
+        *,
+        expected_version: int,
+        content_hash: str,
+        size_tokens: int | None = None,
+        content: bytes | str | None = None,
+        tick: int = 0,
+        trigger: str = "commit_cas",
+    ) -> BasisCasResult:
+        """See :meth:`RegistryBase.commit_cas_if_basis`. The compare and the
+        call into :meth:`commit_cas` share one hold of the lock (the RLock
+        re-enters), so no writer on this registry lands between them; a moved
+        basis returns before ``commit_cas`` runs, so nothing is written or
+        counted for it."""
+        comparands = basis_comparands(basis, artifact_id, expected_version)
+        with self._lock:
+            moved = self._compare_basis(comparands)
+            if moved:
+                return BasisMoved(moved=moved)
+            return self.commit_cas(
+                artifact_id,
+                agent_id,
+                expected_version=expected_version,
+                content_hash=content_hash,
+                size_tokens=size_tokens,
+                content=content,
+                tick=tick,
+                trigger=trigger,
+            )
+
+    def _compare_basis(self, comparands: Mapping[UUID, int]) -> dict[UUID, int | None]:
+        """The basis compare step: every comparand whose current version is
+        not the expected one, ``None`` for one with no record. The caller
+        holds the lock."""
+        current = {
+            artifact_id: self._records[artifact_id].artifact.version
+            for artifact_id in comparands
+            if artifact_id in self._records
+        }
+        return moved_basis_ids(comparands, current)
 
     def commit_all(
         self,

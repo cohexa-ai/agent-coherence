@@ -61,6 +61,14 @@ it refuses, refuses with a plain ``ValueError``, keeps the heartbeat, keeps a
 transient state, miscounts the rows it removed, deletes a peer's row, or
 refuses on a peer's write grant. The scenario MUST FAIL each, naming the
 obligation dropped.
+
+The compare-outside-the-transaction stub (:class:`_CompareOutsideTxnRegistry`)
+gives the basis window scenario its teeth. It is a real SQLite registry whose
+commit under a basis runs the same named compare step and the same
+compare-and-swap, but the compare in its own read and the commit in a later
+transaction. A writer on a second handle lands in between, and the scenario
+MUST FAIL it; the sequential basis scenarios still pass it, so the failure is
+the window's, not a broken stub's.
 """
 
 from __future__ import annotations
@@ -74,7 +82,15 @@ from uuid import UUID
 import pytest
 
 from ccs.coordinator.registry import ArtifactRegistry
-from ccs.coordinator.registry_protocol import CLAIM_CAPTURE_TRIGGERS, CasResult, forget_refusal
+from ccs.coordinator.registry_protocol import (
+    CLAIM_CAPTURE_TRIGGERS,
+    BasisCasResult,
+    BasisMoved,
+    CasResult,
+    basis_comparands,
+    forget_refusal,
+)
+from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import STALE_READ_GENERATION_REASON, ForgetRefused, StaleReadGeneration
 from ccs.core.states import MESIState
 from ccs.core.types import CasCorruption, ConflictDetail, MultiCommitConflict
@@ -950,3 +966,87 @@ def test_degraded_stub_fence_reject_leg_still_holds() -> None:
     Documents the exact blast radius of the injected bug (one leg, not the fence).
     """
     kit.assert_fence_rejects_superseded_read_generation(_DegradedFactory())
+
+
+class _CompareOutsideTxnRegistry(SqliteArtifactRegistry):
+    """A degraded SQLite backend: the basis is compared in its own read and the
+    target committed in a later transaction. Same compare step, same
+    compare-and-swap, but two steps where the contract demands one. The handle's
+    lock is held throughout, so only a writer on a SECOND handle can land in
+    between, which is the writer the kit's window scenario starts."""
+
+    def commit_cas_if_basis(  # type: ignore[override]
+        self,
+        basis: dict[UUID, int],
+        artifact_id: UUID,
+        agent_id: UUID,
+        *,
+        expected_version: int,
+        **cas: object,
+    ) -> BasisCasResult:
+        comparands = basis_comparands(basis, artifact_id, expected_version)
+        with self._lock:
+            # THE DEGRADATION: no BEGIN IMMEDIATE around the compare.
+            moved = self._compare_basis(comparands)
+            if moved:
+                return BasisMoved(moved=moved)
+            return self.commit_cas(
+                artifact_id, agent_id, expected_version=expected_version, **cas  # type: ignore[arg-type]
+            )
+
+
+class _CompareOutsideTxnFactory:
+    """Mints :class:`_CompareOutsideTxnRegistry` handles over one store, as the
+    kit's SQLite factory does, and closes them all."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self._path = tmp_path / "compare-outside-txn.db"
+        self._handles: list[_CompareOutsideTxnRegistry] = []
+
+    def __call__(self) -> _CompareOutsideTxnRegistry:
+        reg = _CompareOutsideTxnRegistry(self._path)
+        self._handles.append(reg)
+        return reg
+
+    def close_all(self) -> None:
+        for reg in self._handles:
+            reg.close()
+        self._handles.clear()
+
+    @property
+    def db_path(self) -> Path | None:
+        return self._path
+
+
+@pytest.mark.usefixtures("two_writer_store")
+def test_compare_outside_txn_stub_fails_the_basis_window_scenario(tmp_path: Path) -> None:
+    """THE TEETH for the basis window: a commit whose compare runs outside its
+    own transaction lets a second handle's writer land between the compare and
+    the compare-and-swap, and the kit MUST FAIL it, naming that window."""
+    factory = _CompareOutsideTxnFactory(tmp_path)
+    try:
+        with pytest.raises(AssertionError) as excinfo:
+            kit.assert_peer_cannot_land_between_basis_compare_and_commit(factory)
+    finally:
+        factory.close_all()
+    assert "landed between the basis compare and the commit" in str(excinfo.value)
+
+
+@pytest.mark.usefixtures("two_writer_store")
+def test_compare_outside_txn_stub_still_passes_the_sequential_basis_scenarios(
+    tmp_path: Path,
+) -> None:
+    """With no writer in the window, the stub answers as a correct backend does,
+    so the window scenario fails it for the window alone. One store per
+    scenario, as the kit's fixture gives each."""
+    for scenario in (
+        kit.assert_basis_rows_find_rows_by_registration_and_name,
+        kit.assert_moved_basis_reports_every_move_and_writes_nothing,
+    ):
+        store_dir = tmp_path / scenario.__name__
+        store_dir.mkdir()
+        factory = _CompareOutsideTxnFactory(store_dir)
+        try:
+            scenario(factory)
+        finally:
+            factory.close_all()

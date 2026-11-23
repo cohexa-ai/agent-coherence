@@ -59,6 +59,7 @@ from ccs.adapters.coherent_volume import (
 )
 from ccs.cli._coherence_client import CoordinatorEndpoint, CoordinatorUnavailable, escape_nonprintable
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry, StoreHeldError
+from ccs.core.basis import BasisMember
 from ccs.core.exceptions import (
     CasRetriesExhausted,
     CasVersionConflict,
@@ -2701,9 +2702,7 @@ def test_write_cas_recovers_from_sticky_strict_deny_and_converges(
 
         # Confirm B really is in the sticky-deny state BEFORE write_cas: a bare
         # version-aware read reports stale_denied=True (INVALID, not re-granted).
-        _bytes, _ver, stale_denied, _gen, _stale, _differs = vol_b._read_with_version(
-            "data/shared.txt"
-        )
+        stale_denied = vol_b._read_with_version("data/shared.txt").stale_denied
         assert stale_denied is True, "precondition: B must be a sticky strict-deny"
 
         seen: list[bytes] = []
@@ -8170,12 +8169,21 @@ def test_a_write_whose_commit_is_refused_for_its_principal_and_whose_re_claim_ge
         stop_coordinator(tmp_path)
 
 
+def _commit_under_a_basis(vol: CoherentVolume, rel: str, version: int, content: bytes) -> object:
+    """``commit_if_basis`` of ``rel`` under a basis of ``rel`` alone, at the
+    version read just before (a hand-built member, compared by version)."""
+    return vol.commit_if_basis([BasisMember(rel, version)], rel, version, content)
+
+
 #: The commit legs that never write to disk before a confirmed win, each run
 #: once with an expected version read just before.
 _CAS_COMMIT_SURFACES = {
     **_CAS_ONCE,
     "atomic_publish": lambda vol, rel, version: vol.atomic_publish([(rel, version, b"mine")]),
+    "commit_if_basis": lambda vol, rel, version: _commit_under_a_basis(vol, rel, version, b"mine"),
 }
+#: The route each of those surfaces commits on, when not the compare-and-swap's.
+_CAS_COMMIT_ROUTES = {"commit_if_basis": "/basis/commit"}
 
 
 @pytest.mark.parametrize("commit", ["refused", "unanswered"])
@@ -8189,22 +8197,24 @@ def test_a_cas_with_no_answer_is_unreachable_when_never_sent_and_unconfirmed_whe
     left and cannot have landed: ``CoordinatorUnreachable``. Delivered to a
     listener that never answers, it may have landed: ``CommitUnconfirmed``,
     saying the outcome is unknown and to re-read. Either way the CAS is sent
-    once and no byte touches disk. Covers write_cas, write_cas_at, and a
-    single-member atomic_publish, which takes write_cas_at's path. Before,
-    both raised a bare ``CoherenceError``. Raising ``CoordinatorUnreachable``
-    for the delivered case would tell a caller "nothing happened" of a commit
-    that may have landed."""
+    once and no byte touches disk. Covers write_cas, write_cas_at, a
+    single-member atomic_publish, which takes write_cas_at's path, and
+    commit_if_basis, on its own route. Before, both raised a bare
+    ``CoherenceError``. Raising ``CoordinatorUnreachable`` for the delivered
+    case would tell a caller "nothing happened" of a commit that may have
+    landed."""
     from ccs.core.exceptions import CommitUnconfirmed
 
     rel = "data/shared.txt"
     target = _seed(tmp_path, content=b"v1")
+    route = _CAS_COMMIT_ROUTES.get(surface, "/hooks/post-edit-cas")
     silent = _SilentListener()
     vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
     try:
         _data, version = vol.read_with_version(rel)
         calls: list[tuple[str, dict, dict]] = []
         moved = refused_endpoint if commit == "refused" else (lambda e: replace(e, port=silent.port))
-        _route_one_commit(monkeypatch, lambda path, _b: path == "/hooks/post-edit-cas", moved, calls)
+        _route_one_commit(monkeypatch, lambda path, _b: path == route, moved, calls)
 
         with pytest.raises(CoherenceError) as raised:
             _CAS_COMMIT_SURFACES[surface](vol, rel, version)
@@ -8216,9 +8226,9 @@ def test_a_cas_with_no_answer_is_unreachable_when_never_sent_and_unconfirmed_whe
         else:
             assert type(raised.value) is CommitUnconfirmed, repr(raised.value)
             assert "whether it landed is unknown" in message and "Re-read" in message, message
-            assert silent.seen == ["/hooks/post-edit-cas"], "control: the CAS was delivered"
+            assert silent.seen == [route], "control: the CAS was delivered"
         assert isinstance(raised.value.__cause__, CoordinatorUnavailable), repr(raised.value.__cause__)
-        assert [path for path, _b, _k in calls].count("/hooks/post-edit-cas") == 1, "sent once"
+        assert [path for path, _b, _k in calls].count(route) == 1, "sent once"
         assert target.read_bytes() == b"v1", "an unconfirmed CAS touched disk"
     finally:
         silent.close()
@@ -8567,12 +8577,15 @@ _COMMIT_LEGS: dict[str, tuple[str, Callable[[str, dict], bool]]] = {
     "write_cas_at": ("/hooks/post-edit-cas", _is_cas_commit),
     "write_cas": ("/hooks/post-edit-cas", _is_cas_commit),
     "write": ("/hooks/post-edit", _is_write_commit),
+    "commit_if_basis": ("/basis/commit", lambda path, _payload: path == "/basis/commit"),
 }
 
 
 def _run_commit_leg(vol: CoherentVolume, leg: str, rel: str, version: int) -> None:
     if leg == "write":
         vol.write(rel, b"v2")
+    elif leg == "commit_if_basis":
+        _commit_under_a_basis(vol, rel, version, b"v2")
     else:
         _CAS_ONCE[leg](vol, rel, version)
 

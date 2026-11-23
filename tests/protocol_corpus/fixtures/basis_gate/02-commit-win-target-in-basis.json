@@ -1,0 +1,39 @@
+{
+  "name": "basis-commit-win-target-in-basis",
+  "description": "WIN. A session read docs/plan.md at version 1, derived new content from it, and commits that content with docs/plan.md as both the basis and the target. The basis held and the target's compare-and-swap won, so the answer is proceed with the committed path and its new version. No handoff record exists for the path, so the body carries no `handoff` key.",
+  "setup": {
+    "tracked": ["docs/**"],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "path": "docs/plan.md",
+          "content_hash": "f9b414ed170aade26e96b08b64710e279b57971274301dc1c4c22fb63de6eec6"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/basis/commit",
+    "body": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "basis": [{"path": "docs/plan.md", "version": 1}],
+      "target": {"path": "docs/plan.md", "version": 1},
+      "content_hash": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "answer": "proceed",
+      "committed": {"path": "docs/plan.md", "version": 2}
+    }
+  },
+  "backends": ["python"]
+}

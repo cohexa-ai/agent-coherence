@@ -55,6 +55,19 @@ write grant and not for a peer's, its transient state gone with its rows,
 the row that records a sweep reclaim kept and left INVALID, and nobody
 else's records touched.
 
+Three scenarios certify the basis pair, the read a caller records its inputs
+with and the commit that lands only while they are unchanged.
+:func:`assert_basis_rows_find_rows_by_registration_and_name` (lookup only, and a
+deleted row's registration never resolves again);
+:func:`assert_moved_basis_reports_every_move_and_writes_nothing` (every moved or
+vanished id reported, the target's too whether or not it is a member, and
+nothing written); and
+:func:`assert_peer_cannot_land_between_basis_compare_and_commit`, which starts a
+peer writer from the registry's named basis-compare step (``_compare_basis``)
+and requires it to land only after the commit. On SQLite the peer writes
+through a second handle, so only a compare inside the commit's own transaction
+holds it off.
+
 **BACKEND-DEFINED** (``assert_declared_*`` functions taking a
 :class:`RegistryFactory` AND a :class:`RestartDeclaration`): behaviors the
 contract explicitly lets backends DIVERGE on — restart survival, sweep timing.
@@ -77,6 +90,7 @@ it (proving the kit discriminates).
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 import sys
 import threading
 import time
@@ -89,7 +103,7 @@ from uuid import UUID, uuid4
 
 from ccs.coordinator.backend_contract import R18_LIVENESS_SOURCE, LivenessSourceObligation
 from ccs.coordinator.registry import ArtifactRegistry
-from ccs.coordinator.registry_protocol import TransferRequest
+from ccs.coordinator.registry_protocol import BasisMoved, TransferRequest
 from ccs.coordinator.service import CoordinatorService, ReleaseRequest
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import (
@@ -1932,6 +1946,229 @@ def assert_forget_agent_forgets_only_an_ended_identity(factory: RegistryFactory)
     _assert_reclaim_row_kept_unread(reg, world)
     _assert_peers_no_longer_count_it(svc, world)
     assert reg.forget_agent(world.ended) == 0, "a second forget_agent removed rows"  # type: ignore[attr-defined]
+
+
+def _registration_named(reg: object, name: str) -> str:
+    """The registration of the one row named ``name``, read through ``basis_rows``."""
+    rows = reg.basis_rows((), (name,))  # type: ignore[attr-defined]
+    assert len(rows) == 1, f"scenario precondition: one row is named {name!r}, got {rows!r}"
+    return rows[0].registration
+
+
+def assert_basis_rows_find_rows_by_registration_and_name(factory: RegistryFactory) -> None:
+    """Basis lookup (MUST-MATCH). ``basis_rows`` returns, for every row whose
+    registration or exact name is asked, its id, name, current version and
+    registration, a UUID in canonical dashed form. It is lookup only: a name no
+    row carries returns nothing and mints no row. A deleted row's registration
+    returns nothing, even once a row of the same name is registered in its
+    place: a caller that recorded the old registration must see the input as
+    replaced, never as the new row."""
+    reg = factory()
+    brief, plan, notes = uuid4(), uuid4(), uuid4()
+    _register(reg, brief, version=3, name="brief.md")
+    _register(reg, plan, version=1, name="plan.md")
+    _register(reg, notes, version=2, name="notes.md")
+    brief_registration = _registration_named(reg, "brief.md")
+    assert brief_registration == str(UUID(brief_registration)), (
+        f"a registration is a UUID in canonical dashed form, got {brief_registration!r}"
+    )
+
+    rows = reg.basis_rows((brief_registration,), ("notes.md", "absent.md"))  # type: ignore[attr-defined]
+    assert {(row.artifact_id, row.name, row.version) for row in rows} == {
+        (brief, "brief.md", 3),
+        (notes, "notes.md", 2),
+    }, f"basis_rows must return exactly the rows asked for, got {rows!r}"
+    by_id = {row.artifact_id: row.registration for row in rows}
+    assert by_id[brief] == brief_registration
+    assert sorted(reg.artifact_ids()) == sorted([brief, plan, notes]), (  # type: ignore[attr-defined]
+        "basis_rows minted a row for a name nobody registered"
+    )
+
+    reg.remove_artifact(brief)  # type: ignore[attr-defined]
+    assert reg.basis_rows((brief_registration,), ()) == [], (  # type: ignore[attr-defined]
+        "a deleted row's registration still resolved"
+    )
+    _register(reg, uuid4(), version=1, name="brief.md")
+    assert reg.basis_rows((brief_registration,), ()) == [], (  # type: ignore[attr-defined]
+        "a deleted row's registration resolved to the row registered in its place"
+    )
+    assert _registration_named(reg, "brief.md") != brief_registration
+
+
+def _peer_cas(reg: object, artifact_id: UUID, *, expected: int) -> None:
+    """A compare-and-swap by a fresh writer that holds no grant, moving
+    ``artifact_id`` from ``expected`` to the next version."""
+    won = reg.commit_cas(  # type: ignore[attr-defined]
+        artifact_id, uuid4(), expected_version=expected, content_hash=_hash(f"peer-{expected}"), tick=3
+    )
+    assert isinstance(won, tuple), f"scenario precondition: the peer's commit must win, got {won!r}"
+
+
+def _written_state(reg: object, artifact_id: UUID, agents: tuple[UUID, ...]) -> tuple[object, ...]:
+    """Everything a commit writes on ``artifact_id``, as the base contract reads it."""
+    artifact = reg.get_artifact(artifact_id)  # type: ignore[attr-defined]
+    return (
+        artifact.version,
+        artifact.content_hash,
+        reg.get_owner_generation(artifact_id),  # type: ignore[attr-defined]
+        reg.get_state_map(artifact_id),  # type: ignore[attr-defined]
+        reg.get_transient_map(artifact_id),  # type: ignore[attr-defined]
+        tuple(reg.get_read_generation(artifact_id, agent) for agent in agents),  # type: ignore[attr-defined]
+        tuple(reg.last_observed_version_for(artifact_id, agent) for agent in agents),  # type: ignore[attr-defined]
+    )
+
+
+def assert_moved_basis_reports_every_move_and_writes_nothing(factory: RegistryFactory) -> None:
+    """A moved basis (MUST-MATCH). ``commit_cas_if_basis`` compares every basis
+    id, and the target's expected version whether or not the target is listed,
+    before any compare-and-swap leg. On any difference it returns
+    :class:`BasisMoved` naming EVERY moved id with its current version, and
+    ``None`` for an id no row carries, and writes nothing: the target keeps its
+    version, content hash, epoch and every agent's state. A moved target is a
+    basis move, never ``version_mismatch``; a vanished one is a basis move,
+    never ``KeyError``. Stopping at the first moved member fails here: two
+    members move and one vanishes."""
+    reg = factory()
+    brief, policy, dropped, approvals = uuid4(), uuid4(), uuid4(), uuid4()
+    for name, artifact_id in (
+        ("brief.md", brief), ("policy.md", policy), ("dropped.md", dropped), ("approvals.md", approvals),
+    ):
+        _register(reg, artifact_id, version=1, name=name)
+    agent, reader = uuid4(), uuid4()
+    reg.set_agent_state(approvals, reader, MESIState.SHARED, trigger="fetch", tick=1)  # type: ignore[attr-defined]
+    _seed_shared_writer(reg, approvals, agent)
+    _peer_cas(reg, brief, expected=1)
+    _peer_cas(reg, policy, expected=1)
+    _peer_cas(reg, policy, expected=2)
+    reg.remove_artifact(dropped)  # type: ignore[attr-defined]
+    before = _written_state(reg, approvals, (agent, reader))
+
+    result = reg.commit_cas_if_basis(  # type: ignore[attr-defined]
+        {brief: 1, policy: 1, dropped: 1, approvals: 1},
+        approvals, agent, expected_version=1, content_hash=_hash("approved"), tick=5,
+    )
+    assert isinstance(result, BasisMoved), f"a moved basis must return BasisMoved, got {result!r}"
+    assert dict(result.moved) == {brief: 2, policy: 3, dropped: None}, (
+        f"every moved or vanished member must be named with its current version, got {result.moved!r}"
+    )
+    assert _written_state(reg, approvals, (agent, reader)) == before, (
+        "a commit refused by its basis wrote to the target"
+    )
+
+    # The target outside the basis, moved: compared all the same.
+    _peer_cas(reg, approvals, expected=1)
+    moved_target = reg.commit_cas_if_basis(  # type: ignore[attr-defined]
+        {brief: 2}, approvals, agent, expected_version=1, content_hash=_hash("approved"), tick=6
+    )
+    assert isinstance(moved_target, BasisMoved), (
+        f"a moved target outside the basis must be a basis move, never a compare-and-swap refusal, got {moved_target!r}"
+    )
+    assert dict(moved_target.moved) == {approvals: 2}
+
+    # The target outside the basis, vanished.
+    reg.remove_artifact(approvals)  # type: ignore[attr-defined]
+    vanished_target = reg.commit_cas_if_basis(  # type: ignore[attr-defined]
+        {brief: 2}, approvals, agent, expected_version=2, content_hash=_hash("approved"), tick=7
+    )
+    assert isinstance(vanished_target, BasisMoved), (
+        f"a vanished target must be a basis move, got {vanished_target!r}"
+    )
+    assert dict(vanished_target.moved) == {approvals: None}
+
+
+# How long the peer writer is given to land while the basis commit is between
+# its compare and its compare-and-swap. Its absence after this long is the
+# observation; the effect gate's window tests use the same figure.
+_BASIS_WINDOW_WAIT = 0.5
+# The bound on the peer's own wait: retries of a locked store and the final join.
+_BASIS_PEER_BOUND = 10.0
+
+
+def _cas_retrying_a_locked_store(reg: object, artifact_id: UUID, outcome: list[object]) -> None:
+    """The peer's compare-and-swap, on its own thread and (SQLite) its own
+    handle. A write lock held past the store's busy timeout raises ``database
+    is locked``, which a slow runner can reach while the basis commit holds its
+    transaction open; the peer retries that until a bound, so the scenario
+    observes ordering rather than the timeout."""
+    deadline = time.monotonic() + _BASIS_PEER_BOUND
+    while True:
+        try:
+            outcome.append(
+                reg.commit_cas(  # type: ignore[attr-defined]
+                    artifact_id, uuid4(), expected_version=1, content_hash=_hash("peer"), tick=6
+                )
+            )
+            return
+        except sqlite3.OperationalError as exc:
+            busy = (getattr(exc, "sqlite_errorcode", 0) & 0xFF) == sqlite3.SQLITE_BUSY
+            if not busy or time.monotonic() >= deadline:
+                outcome.append(exc)
+                return
+
+
+def assert_peer_cannot_land_between_basis_compare_and_commit(factory: RegistryFactory) -> None:
+    """The basis compare and the target's compare-and-swap are one step
+    (MUST-MATCH). A peer writer starts the moment the registry's named compare
+    step (``_compare_basis``) returns and is given ``_BASIS_WINDOW_WAIT``
+    seconds to commit a non-target member. It must still be waiting when that
+    window ends; the target then wins on the basis it was compared against, and
+    the peer lands afterwards.
+
+    On SQLite the peer writes through a SECOND handle on the same store, so the
+    registry lock does not hold it off: only a compare that runs inside the
+    commit's own ``BEGIN IMMEDIATE`` does. A backend that compares in a
+    separate read and commits in a later transaction lets the peer land in
+    between, and its commit then lands on a basis that has already moved. The
+    in-memory arm runs both writers on one registry, where its lock is the
+    serialization."""
+    reg = factory()
+    peer_reg = factory() if factory.db_path is not None else reg
+    member, target = uuid4(), uuid4()
+    _register(reg, member, version=1, name="brief.md")
+    _register(reg, target, version=1, name="approvals.md")
+
+    peer_outcome: list[object] = []
+    peer = threading.Thread(
+        target=_cas_retrying_a_locked_store, args=(peer_reg, member, peer_outcome), daemon=True
+    )
+    seam: dict[str, object] = {"fired": 0, "landed_in_window": None}
+    real_compare = reg._compare_basis  # type: ignore[attr-defined]  # noqa: SLF001 - the named seam
+
+    def compare_then_start_peer(comparands: object) -> object:
+        moved = real_compare(comparands)
+        seam["fired"] = int(seam["fired"]) + 1  # type: ignore[call-overload]
+        if seam["fired"] == 1:
+            peer.start()
+            peer.join(timeout=_BASIS_WINDOW_WAIT)
+            seam["landed_in_window"] = not peer.is_alive()
+        return moved
+
+    reg._compare_basis = compare_then_start_peer  # type: ignore[attr-defined]  # noqa: SLF001
+    try:
+        result = reg.commit_cas_if_basis(  # type: ignore[attr-defined]
+            {member: 1}, target, uuid4(), expected_version=1, content_hash=_hash("approved"), tick=5
+        )
+    finally:
+        del reg._compare_basis  # type: ignore[attr-defined]  # noqa: SLF001
+        if peer.is_alive():
+            peer.join(timeout=_BASIS_PEER_BOUND)
+
+    assert seam["fired"] == 1, (
+        "the commit never ran its named basis-compare step, so the peer was never started"
+    )
+    assert seam["landed_in_window"] is False, (
+        "a peer writer landed between the basis compare and the commit: the compare does "
+        "not run inside the commit's own transaction, so the target can commit on a basis "
+        "that has already moved"
+    )
+    assert isinstance(result, tuple) and result[0].version == 2, (
+        f"the target must win on the unmoved basis, got {result!r}"
+    )
+    assert not peer.is_alive(), "the peer writer never landed after the commit"
+    assert len(peer_outcome) == 1 and isinstance(peer_outcome[0], tuple), (
+        f"the peer's own commit must land after the basis commit, got {peer_outcome!r}"
+    )
+    assert reg.get_artifact(member).version == 2  # type: ignore[attr-defined]
 
 
 # ===========================================================================

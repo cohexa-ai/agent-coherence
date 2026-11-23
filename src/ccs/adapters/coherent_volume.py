@@ -44,7 +44,7 @@ import urllib.error
 import uuid
 import warnings
 import weakref
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NamedTuple
@@ -52,6 +52,7 @@ from typing import Literal, NamedTuple
 from ccs.adapters.claude_code.coordinator_server import (
     parse_agent_id,
     session_to_agent_id,
+    validate_path,
     write_start_policy,
 )
 from ccs.adapters.claude_code.lifecycle import (
@@ -86,7 +87,18 @@ from ccs.cli._coherence_client import (
     post as _coordinator_post,
 )
 from ccs.coordinator.fold_merge import index_key_of
+from ccs.coordinator.service import BASIS_MAX_MEMBERS
 from ccs.coordinator.sqlite_registry import StoreHeldError
+from ccs.core.basis import (
+    ANSWER_PROCEED,
+    NAME_KIND_FILE,
+    NAME_KIND_KEY,
+    BasisCheckAnswer,
+    BasisCommitAnswer,
+    BasisMember,
+    CommittedTarget,
+    TargetRefusal,
+)
 from ccs.core.disk_spelling import native_spelling
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_CLAIMED_REASON,
@@ -96,10 +108,12 @@ from ccs.core.exceptions import (
     HANDOFF_NOT_LIVE_REASON,
     HANDOFF_NOT_SUCCESSOR_REASON,
     OCC_CALLER_TRANSIENT_REASON,
+    OCC_IS_SHARED_OR_INVALID_ONLY_REASON,
     OTHER_HOLDER_REASON,
     SPLIT_PAIR_REASON,
     STALE_READ_GENERATION_REASON,
     UNAVAILABLE_REASON,
+    BasisCheckAbsent,
     CallerPrincipalRefused,
     CasRetriesExhausted,
     CasVersionConflict,
@@ -125,7 +139,7 @@ from ccs.core.exceptions import (
     _is_handler_failure_reason,
 )
 from ccs.core.fence import confirmed_generation
-from ccs.core.path_fold import FOLD_TABLE_UNICODE_VERSION, FoldProfile
+from ccs.core.path_fold import FOLD_TABLE_UNICODE_VERSION, FoldProfile, tidy_path
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +182,15 @@ class _ReadResult(NamedTuple):
     #: also covers a coordinator holding no recorded hash to compare against;
     #: the wire does not tell the two apart.
     content_differs: bool
+    #: The answer carried a ``registration`` key. Set only on a read that asked
+    #: for one (:meth:`CoherentVolume.read_for_basis`); an admitted answer that
+    #: reports a version without the key comes from a coordinator that does not
+    #: serve the basis check.
+    registration_reported: bool = False
+    #: The registration the answer reported: the token of the row the version
+    #: was read from, or ``None`` when it reported ``null`` (the coordinator
+    #: records no content for the file) or none at all.
+    registration: str | None = None
 
     @property
     def split_pair(self) -> bool:
@@ -265,13 +288,14 @@ def _confirms_end(resp: object) -> bool:
 def _is_commit_leg(endpoint_path: str, payload: dict) -> bool:
     """Whether a request is a commit leg: write()'s ``success: true``
     post-edit (not the release it sends on the same route), the
-    compare-and-swap of ``write_cas`` and ``write_cas_at``, or
-    ``atomic_publish``'s batch commit. Whether one of these reached the
-    coordinator decides what a strict volume raises when it gets no answer
-    or an HTTP 5xx. Classified here, by route, rather than by a keyword each
-    caller passes, so every call keeps ``_post``'s two-argument shape, which
-    stand-ins for ``_post`` rely on."""
-    if endpoint_path in ("/hooks/post-edit-cas", "/session/commit_all"):
+    compare-and-swap of ``write_cas`` and ``write_cas_at``,
+    ``atomic_publish``'s batch commit, or ``commit_if_basis``'s commit under
+    a basis. Whether one of these reached the coordinator decides what a
+    strict volume raises when it gets no answer or an HTTP 5xx. Classified
+    here, by route, rather than by a keyword each caller passes, so every
+    call keeps ``_post``'s two-argument shape, which stand-ins for ``_post``
+    rely on."""
+    if endpoint_path in ("/hooks/post-edit-cas", "/session/commit_all", _BASIS_COMMIT_ROUTE):
         return True
     return endpoint_path == "/hooks/post-edit" and payload.get("success") is True
 
@@ -420,6 +444,171 @@ def _route_not_served_message(route: str) -> str:
     return (
         f"the coordinator does not serve {route} (HTTP 404), so nothing ran and a retry "
         "gets the same answer. The Node coordinator has no snapshot sessions or handoffs."
+    )
+
+
+_BASIS_CHECK_ROUTE = "/basis/check"
+_BASIS_COMMIT_ROUTE = "/basis/commit"
+#: The basis routes, which only the Python coordinator serves. Kept apart from
+#: the session and handoff routes: a 404 here raises
+#: :class:`~ccs.core.exceptions.BasisCheckAbsent`, its own type and text.
+_BASIS_ROUTES = frozenset({_BASIS_CHECK_ROUTE, _BASIS_COMMIT_ROUTE})
+
+#: Why the basis calls refuse silence: an input nobody confirmed is never
+#: taken for one that did not move.
+_ONLY_PYTHON_SERVES_BASIS = (
+    "Only the Python coordinator serves the basis check; the Node coordinator and "
+    "older Python coordinators do not."
+)
+
+
+def _basis_route_not_served_message(route: str) -> str:
+    """What a basis request raises (:class:`~ccs.core.exceptions.BasisCheckAbsent`)
+    when the coordinator answers it 404: it does not serve the route, so
+    nothing ran."""
+    return (
+        f"the coordinator does not serve {route} (HTTP 404), so it cannot answer for a "
+        f"basis: nothing ran, and a retry gets the same answer. {_ONLY_PYTHON_SERVES_BASIS}"
+    )
+
+
+def _basis_detached_message(verb: str) -> str:
+    """What a basis call raises on a volume with no coordinator attached, in
+    both ``on_error`` modes: a degrade volume's best-effort mode has no
+    answer to give for a basis."""
+    return (
+        f"this CoherentVolume has no coordinator attached, so it cannot {verb}: no "
+        "coordinator can confirm it, and silence is never taken for unchanged. Nothing "
+        "was sent."
+    )
+
+
+def _no_confirmed_version_message(rel: str) -> str:
+    """What :meth:`CoherentVolume.read_for_basis` raises when its read
+    confirmed no version: an untracked file, or an answer that confirmed
+    nothing (none, degraded, a failure), which degrade mode already warned of."""
+    return (
+        f"cannot record a basis member for {rel}: the coordinator confirmed no version "
+        "for it (it does not track the file, or its answer did not confirm the read), "
+        "and a member records only a confirmed version."
+    )
+
+
+def _basis_read_refused_message(rel: str) -> str:
+    """What :meth:`CoherentVolume.read_for_basis` raises
+    (:class:`~ccs.core.exceptions.StaleView`) for a read the coordinator
+    refused over bytes it does record: this volume's view is invalid."""
+    return (
+        f"cannot record a basis member for {rel}: the coordinator refused the read, so "
+        "this volume's view of the file is not current. reacquire() and read it again."
+    )
+
+
+def _registration_not_reported_message(rel: str) -> str:
+    """What :meth:`CoherentVolume.read_for_basis` raises
+    (:class:`~ccs.core.exceptions.BasisCheckAbsent`) for an admitted read
+    that reports a version but no registration."""
+    return (
+        f"cannot record a basis member for {rel}: the coordinator answered the read "
+        "without a registration, so it does not serve the basis check. Only the Python "
+        "coordinator serves it; the Node coordinator and older Python coordinators do not."
+    )
+
+
+def _no_content_recorded_message(rel: str) -> str:
+    """What :meth:`CoherentVolume.read_for_basis` raises when the coordinator
+    reports a ``null`` registration: it records no content for the file (a
+    row first seen through a shell read, or a legacy row). Retrying alone
+    never clears it, so the text names what does."""
+    return (
+        f"cannot record a basis member for {rel}: the coordinator holds no content for "
+        "the file yet, so its version vouches for no bytes and it reports no "
+        "registration to record. Reading again does not change that: a commit of the "
+        "file through the coordinator (write(), write_cas or write_cas_at) records its "
+        "content, and a read after that commit records the member."
+    )
+
+
+#: What a basis check raises when degrade mode already warned that its request
+#: got no usable answer (none, a 4xx or a 5xx).
+_BASIS_CHECK_UNANSWERED_MESSAGE = (
+    "the basis check got no answer this volume can use (on_error='degrade' warned "
+    "of the failure), so nothing is known about the inputs and the check is not "
+    "taken as unchanged. Check again once the coordinator answers."
+)
+#: What a basis check raises for an answer it cannot classify.
+_BASIS_CHECK_UNCLASSIFIABLE_MESSAGE = (
+    "the basis check was answered with nothing this client can classify (no "
+    "proceed or hold it can read), so nothing is known about the inputs and the "
+    "check is not taken as unchanged."
+)
+
+
+def _failed_basis_check_message(reason: str) -> str:
+    """What a basis check raises (:class:`~ccs.core.exceptions.CoordinatorFailed`)
+    when the coordinator answered it with its failure envelope. A check
+    commits nothing, so one retry is safe. ``reason`` is the envelope's."""
+    return (
+        f"the coordinator answered the basis check with a failure ({reason}), so "
+        "nothing was checked. Retry once after a short wait; if it fails the same "
+        "way, report that the coordinator is failing."
+    )
+
+
+def _unconfirmed_proceed_message(paths: Sequence[str]) -> str:
+    """What a basis check raises when a proceed does not confirm every member
+    at the version recorded for it."""
+    return (
+        "the basis check answered proceed without confirming every member at the "
+        f"version recorded for it ({', '.join(paths)}), so it is not taken as unchanged."
+    )
+
+
+def _unconfirmed_basis_commit_message(rel: str) -> str:
+    """What a commit under a basis raises
+    (:class:`~ccs.core.exceptions.CommitUnconfirmed`) when the coordinator
+    answered that its outcome is unknown: the work may have won."""
+    return (
+        f"commit of {rel} under its basis was not confirmed (the coordinator answered "
+        "that its outcome is unknown); whether it landed is unknown, and the write did "
+        "not touch disk. Re-read the target, and retry only if the commit is absent."
+    )
+
+
+def _unclassifiable_basis_commit_message(rel: str) -> str:
+    """What a commit under a basis raises
+    (:class:`~ccs.core.exceptions.CommitUnconfirmed`) for an answer it cannot
+    classify: nothing says whether it landed."""
+    return (
+        f"commit of {rel} under its basis was answered with nothing this client can "
+        "classify (no proceed or hold it can read); whether it landed is unknown, and "
+        "the write did not touch disk. Re-read the target, and retry only if the "
+        "commit is absent."
+    )
+
+
+_DescribedMember = tuple[str, str, str | None]  # (path, door key, registration)
+
+
+def _names_one_row(one: _DescribedMember, other: _DescribedMember) -> bool:
+    """Whether two members reach one row as far as their descriptions show,
+    by the coordinator's own repeat rule: the same path, two spellings it
+    keys alike, or the same registration. One row carries one comparand."""
+    (path, key, registration), (other_path, other_key, other_registration) = one, other
+    return (
+        path == other_path
+        or key == other_key
+        or (registration is not None and registration == other_registration)
+    )
+
+
+def _basis_target_held_for_writing_message(rel: str) -> str:
+    """What a commit under a basis raises when the coordinator refused it
+    because this volume's attempt holds the target for writing."""
+    return (
+        f"the coordinator refused the commit of {rel} under its basis: this volume's "
+        f"attempt holds the file for writing ({OCC_IS_SHARED_OR_INVALID_ONLY_REASON}). "
+        "Nothing was committed, and the write did not touch disk."
     )
 
 
@@ -1584,8 +1773,8 @@ class CoherentVolume:
         A no-op outside the post-fork window. Under ``on_error="strict"`` a
         failed attempt keeps that window open: every ``read``,
         ``read_with_version``, ``read_with_version_generation``, ``write``,
-        ``write_cas``, ``write_cas_at`` and ``atomic_publish`` retries until one
-        attaches.
+        ``write_cas``, ``write_cas_at``, ``atomic_publish``, ``read_for_basis``,
+        ``check_basis`` and ``commit_if_basis`` retries until one attaches.
 
         The operations that send a request pass through here first, so a
         closed volume raises here, before anything is sent. :meth:`release`
@@ -3739,6 +3928,354 @@ class CoherentVolume:
         key = self._key_of(rel)
         return any(key in written for written in self._grant_incarnations.values())
 
+    # --- a basis: record what was read, check it, commit only while it holds ---
+
+    def read_for_basis(self, path: str | os.PathLike[str]) -> tuple[bytes, BasisMember]:
+        """Read ``path`` and record it as a member of a basis: the bytes, and a
+        :class:`~ccs.core.basis.BasisMember` naming the path as this volume
+        resolved it, the version the coordinator confirmed and the
+        registration of the row it read, so a later :meth:`check_basis` tells
+        that row from one registered in its place. The member is plain data:
+        another process rebuilds it with ``BasisMember(**fields)``. A remote
+        volume records its members as keys (``name_kind="key"``), every other
+        volume as files.
+
+        It never returns a member that could only hold. It raises, in both
+        ``on_error`` modes, rather than record one from a read that is not
+        confirmed, checked in this order:
+
+        - no coordinator attached, no confirmed answer (none, degraded, a
+          failure envelope, which degrade mode warns of first), or no version
+          (an untracked file): :class:`~ccs.core.exceptions.CoherenceError`,
+          or the typed error a strict read raises for the failure;
+        - a strict refusal: :class:`~ccs.core.exceptions.StaleView`
+          (``reacquire()`` and read again);
+        - bytes the coordinator says are not its content at that version:
+          the split-pair ``StaleView`` (reason ``split_pair``);
+        - an answer with no registration:
+          :class:`~ccs.core.exceptions.BasisCheckAbsent`, since only the
+          Python coordinator serves the basis check;
+        - a ``null`` registration: ``CoherenceError`` saying the coordinator
+          holds no content for the file yet. Reading again does not clear it;
+          a commit of the file through the coordinator does.
+
+        The bytes become this volume's foreign-edit baseline only once every
+        check passed. :meth:`read_with_version` and
+        :meth:`read_with_version_generation` are unchanged by this method.
+        """
+        with self._single_op_guard():
+            self._ensure_attached()
+            if self._endpoint is None:
+                raise CoherenceError(_basis_detached_message("record a basis member"))
+            _abs_path, rel = self._to_relative(path)
+            degradations_before = self._degradation_count
+            result = self._read_with_version(rel, advance_baseline=False, want_registration=True)
+            confirmed = self._degradation_count == degradations_before
+            self._refuse_unconfirmed_basis_read(result, rel, confirmed=confirmed)
+            member = BasisMember(rel, result.version, result.registration, self._basis_name_kind())
+            self._last_observed_hash[self._key_of(rel)] = self._sha256_bytes(result.data)
+            return result.data, member
+
+    @staticmethod
+    def _refuse_unconfirmed_basis_read(result: _ReadResult, rel: str, *, confirmed: bool) -> None:
+        """Raise for a read :meth:`read_for_basis` cannot record a member
+        from, in its documented order. ``confirmed`` is False when degrade mode
+        warned of this read's answer, whatever the body reported."""
+        if not confirmed or result.version == 0:
+            raise CoherenceError(_no_confirmed_version_message(rel))
+        if result.split_pair:
+            raise _split_pair_refusal()
+        if result.stale_denied:
+            raise StaleView(_basis_read_refused_message(rel))
+        if result.content_differs:
+            raise _split_pair_refusal()
+        if not result.registration_reported:
+            raise BasisCheckAbsent(_registration_not_reported_message(rel))
+        if result.registration is None:
+            raise CoherenceError(_no_content_recorded_message(rel))
+
+    def check_basis(self, basis: Iterable[BasisMember]) -> BasisCheckAnswer:
+        """Ask the coordinator whether every member of ``basis`` is still the
+        version (and the registration) recorded for it, at one instant.
+
+        Returns :class:`~ccs.core.basis.BasisCheckAnswer`: ``proceed`` with
+        every member's expected and current version, or ``hold`` with every
+        member that moved, one reason each, and the recovery class
+        (``rederive``: re-read and redo the work). A check the coordinator
+        could not compare in time is a ``hold`` with ``version_unconfirmed``
+        and ``retry``. The check registers, grants and changes nothing, here
+        or at the coordinator; members built by hand without a registration
+        are compared by version only.
+
+        Silence is never taken for unchanged. In both ``on_error`` modes a
+        detached volume raises :class:`~ccs.core.exceptions.CoherenceError`;
+        a coordinator without the route (the Node coordinator, an older
+        Python one) raises :class:`~ccs.core.exceptions.BasisCheckAbsent`; an
+        answer that confirms nothing (none, an HTTP 4xx or 5xx, the failure
+        envelope, an answer this client cannot classify, a proceed that does
+        not confirm every member) raises: strict as for any request
+        (:class:`~ccs.core.exceptions.CoordinatorUnreachable`,
+        :class:`~ccs.core.exceptions.CoordinatorFailed` or
+        ``CoherenceError``), degrade after its warning.
+
+        A basis the coordinator would refuse as malformed raises
+        :class:`ValueError` before anything is sent, with the coordinator's
+        own text: no member, more than the member cap, a path the
+        coordinator's path check refuses, one path, file or registration
+        named twice, or a member of the other kind (this volume's members
+        name keys when it is remote, files otherwise).
+        """
+        with self._single_op_guard():
+            self._ensure_attached()
+            if self._endpoint is None:
+                raise CoherenceError(_basis_detached_message("check a basis"))
+            members = self._basis_members(basis)
+            resp = self._post(
+                _BASIS_CHECK_ROUTE,
+                {"session_id": self._session_id, "basis": [member.to_wire() for member in members]},
+            )
+            return self._settle_basis_check(resp, members)
+
+    @staticmethod
+    def _settle_basis_check(resp: object, members: Sequence[BasisMember]) -> BasisCheckAnswer:
+        """The answer to a check, or the raise for one that confirms nothing.
+        ``resp`` is ``None`` only after degrade mode warned of its failure."""
+        if resp is None:
+            raise CoherenceError(_BASIS_CHECK_UNANSWERED_MESSAGE)
+        if _is_failure_envelope(resp):
+            raise CoordinatorFailed(_failed_basis_check_message(resp["reason"]))  # type: ignore[index]
+        try:
+            answer = BasisCheckAnswer.from_wire(resp)  # type: ignore[arg-type]
+        except (AttributeError, KeyError, TypeError, ValueError):
+            raise CoherenceError(_BASIS_CHECK_UNCLASSIFIABLE_MESSAGE) from None
+        if answer.answer == ANSWER_PROCEED:
+            confirmed = {(entry.path, entry.expected, entry.current) for entry in answer.checked}
+            missing = [m.path for m in members if (m.path, m.version, m.version) not in confirmed]
+            if missing:
+                raise CoherenceError(_unconfirmed_proceed_message(missing))
+        return answer
+
+    def commit_if_basis(
+        self,
+        basis: Iterable[BasisMember],
+        target: str | os.PathLike[str],
+        expected_target_version: int,
+        content: bytes | bytearray,
+    ) -> CasCommitResult | BasisCommitAnswer:
+        """Compare-and-swap ``target`` to ``content`` only while every member
+        of ``basis`` is still what was recorded, in one hold at the
+        coordinator: the basis compare and the target's compare-and-swap are
+        one step, so a peer's commit of a member cannot land between them.
+        Only the target is written; no member moves.
+
+        ``target`` is a path, committed against ``expected_target_version``.
+        A target that names a member of ``basis`` is that member, and
+        ``expected_target_version`` must be its version; any other target is
+        compared by version only (list it in ``basis`` to have its
+        registration compared too).
+
+        Returns, on a win, the :class:`CasCommitResult` that
+        :meth:`write_cas_at` returns: the committed version and what the win
+        did to a live handoff of the target, with ``content`` on disk.
+        Otherwise it returns the hold, a
+        :class:`~ccs.core.basis.BasisCommitAnswer`, and writes nothing:
+
+        - a member or the target moved: ``moved`` with a reason each, and
+          ``rederive``;
+        - the basis held and the target's own compare-and-swap was refused:
+          an empty ``moved`` and the ``target`` refusal, no recovery class;
+        - the coordinator could not take its locks in time: ``reason``
+          ``version_unconfirmed`` and ``retry``.
+
+        It raises, writing nothing, as :meth:`write_cas_at` does for the same
+        refusals: :class:`~ccs.core.exceptions.GiverFenced` for a target this
+        volume's session handed off, and
+        :class:`~ccs.core.exceptions.CoordinatorFailed` for a target refused
+        ``other_holder`` while this volume's own earlier write grant on it is
+        unreleased. An answer that may follow a landed commit (the
+        coordinator's outcome-unknown hold, its failure envelope, no answer
+        after the request may have arrived, an HTTP 5xx, an answer this
+        client cannot classify) raises
+        :class:`~ccs.core.exceptions.CommitUnconfirmed` in both ``on_error``
+        modes: re-read the target, and retry only if the commit is absent. A
+        strict commit that never left raises
+        :class:`~ccs.core.exceptions.CoordinatorUnreachable`; a detached
+        volume raises :class:`~ccs.core.exceptions.CoherenceError`; a
+        coordinator without the route raises
+        :class:`~ccs.core.exceptions.BasisCheckAbsent`.
+
+        Like :meth:`write_cas_at` it starts a new attempt first, which also
+        releases the write grants this volume's :meth:`write` left on other
+        paths. It does not read the target first: a read would register rows
+        a commit under a basis must not. A malformed basis or target raises
+        :class:`ValueError` before anything is sent (see :meth:`check_basis`).
+        """
+        if not isinstance(content, (bytes, bytearray)):
+            raise TypeError(f"content must be bytes, got {type(content).__name__}")
+        with self._single_op_guard():
+            return self._commit_if_basis_impl(basis, target, expected_target_version, bytes(content))
+
+    def _commit_if_basis_impl(
+        self,
+        basis: Iterable[BasisMember],
+        target: str | os.PathLike[str],
+        expected_target_version: int,
+        content: bytes,
+    ) -> CasCommitResult | BasisCommitAnswer:
+        self._ensure_attached()
+        if self._endpoint is None:
+            raise CoherenceError(_basis_detached_message("commit under a basis"))
+        members = self._basis_members(basis)
+        abs_path, rel = self._to_relative(target)
+        described = self._basis_target(members, rel, expected_target_version)
+        self._remint()
+        self._seed_foreign_edit_baseline(abs_path, rel)
+        new_hash = self._sha256_bytes(content)
+        resp = self._post_basis_commit(rel, {
+            "session_id": self._session_id,
+            "basis": [member.to_wire() for member in members],
+            "target": described.to_wire(),
+            "content_hash": new_hash,
+        })
+        answer = self._settle_basis_commit(resp, rel, described)
+        if answer.answer != ANSWER_PROCEED:
+            return answer
+        self._atomic_write(abs_path, content)  # confirmed -> persist
+        self._record_own_write(rel, new_hash)
+        assert answer.committed is not None  # a settled proceed always names it
+        return CasCommitResult(path=rel, version=answer.committed.version, handoff=self._win_outcome(resp))
+
+    def _seed_foreign_edit_baseline(self, abs_path: Path, rel: str) -> None:
+        """Give a path this volume never read the baseline a later ``write()``
+        checks against, as ``write_cas_at``'s comparand read records one. A
+        path that already has a baseline keeps it, so its disk is not read."""
+        key = self._key_of(rel)
+        if key in self._last_observed_hash:
+            return
+        disk_hash = self._disk_hash(abs_path)
+        if disk_hash is not None:
+            self._last_observed_hash[key] = disk_hash
+
+    def _post_basis_commit(self, rel: str, body: dict) -> object:
+        """Send one commit under a basis and return its answer, mapped as
+        :meth:`_post_cas` maps an unanswered compare-and-swap: never sent ->
+        ``CoordinatorUnreachable``; anything else unanswered, in either mode,
+        -> ``CommitUnconfirmed``, because it may have landed. A degrade
+        volume's client passes on a body that is not an object, which the
+        caller settles."""
+        try:
+            resp = self._post(_BASIS_COMMIT_ROUTE, body)
+        except _CommitNotAnswered as no_answer:
+            if no_answer.never_sent:
+                raise CoordinatorUnreachable(
+                    _cas_not_recorded_message(rel, no_answer.detail)
+                ) from no_answer.__cause__
+            raise CommitUnconfirmed(
+                _unanswered_cas_message(rel, no_answer.status)
+            ) from no_answer.__cause__
+        if resp is None:
+            raise CommitUnconfirmed(_unanswered_cas_message(rel))
+        return resp
+
+    def _settle_basis_commit(self, resp: object, rel: str, target: BasisMember) -> BasisCommitAnswer:
+        """The answer to a commit under a basis, or the raise for one that
+        settles nothing or refuses as :meth:`write_cas_at`'s commit does. A
+        proceed must name the target at the version a win commits."""
+        if not isinstance(resp, dict) or "answer" not in resp:
+            if _is_failure_envelope(resp):
+                raise CommitUnconfirmed(_failed_cas_message(rel, resp["reason"]))  # type: ignore[index]
+            raise CommitUnconfirmed(_unclassifiable_basis_commit_message(rel))
+        if resp.get("degraded") or resp.get("reason") == COMMIT_UNCONFIRMED_REASON:
+            raise CommitUnconfirmed(_unconfirmed_basis_commit_message(rel))
+        try:
+            answer = BasisCommitAnswer.from_wire(resp)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            raise CommitUnconfirmed(_unclassifiable_basis_commit_message(rel)) from None
+        if answer.answer == ANSWER_PROCEED:
+            if answer.committed != CommittedTarget(target.path, target.version + 1):
+                raise CommitUnconfirmed(_unclassifiable_basis_commit_message(rel))
+            return answer
+        if answer.target is not None:
+            self._raise_for_target_refusal(answer.target, rel)
+        return answer
+
+    def _raise_for_target_refusal(self, refusal: TargetRefusal, rel: str) -> None:
+        """Raise for a target refusal :meth:`write_cas_at` raises for: the
+        giver's fence, a caller holding the target for writing, and a refusal
+        by this volume's own unreleased grant. Return for a peer's refusal,
+        which the caller gets as the hold."""
+        if refusal.reason == GIVER_FENCED_REASON:
+            raise GiverFenced(rel, refusal.successor, refusal.version_at_transfer)  # type: ignore[arg-type]
+        if refusal.reason == OCC_IS_SHARED_OR_INVALID_ONLY_REASON:
+            raise CoherenceError(_basis_target_held_for_writing_message(rel))
+        self._raise_if_refused_by_own_grant(rel, refusal.reason)
+
+    def _basis_name_kind(self) -> str:
+        """What this volume's members name: keys on a remote coordinator,
+        whose disk is not this volume's, files otherwise."""
+        return NAME_KIND_KEY if self._remote_endpoint is not None else NAME_KIND_FILE
+
+    def _basis_key(self, path: str) -> str:
+        """The key the coordinator finds a member's row by, as its request door
+        computes it: a file tidied and folded by the attached profile, a key
+        exactly as sent."""
+        if self._basis_name_kind() == NAME_KIND_KEY:
+            return path
+        return index_key_of(tidy_path(path), self._fold_profile)
+
+    def _basis_members(self, basis: Iterable[BasisMember]) -> tuple[BasisMember, ...]:
+        """``basis`` as a tuple, refused with :class:`ValueError` (the
+        coordinator's own text) where the coordinator would answer 400, so a
+        caller's mistake never reaches the wire or counts a degradation."""
+        members = tuple(basis)
+        if not members:
+            raise ValueError("basis must be a non-empty list of members")
+        if len(members) > BASIS_MAX_MEMBERS:
+            raise ValueError(f"basis names at most {BASIS_MAX_MEMBERS} members, got {len(members)}")
+        named: list[_DescribedMember] = []
+        for index, member in enumerate(members):
+            self._check_basis_member(member, f"basis[{index}]")
+            row = (member.path, self._basis_key(member.path), member.registration)
+            if any(_names_one_row(row, earlier) for earlier in named):
+                raise ValueError(f"basis[{index}]: basis names one path, file or registration twice")
+            named.append(row)
+        return members
+
+    def _check_basis_member(self, member: object, what: str) -> None:
+        """Refuse a member this volume cannot send: not a member, of the other
+        kind, or with a path the coordinator's path check refuses."""
+        if not isinstance(member, BasisMember):
+            raise TypeError(f"{what} must be a BasisMember, got {type(member).__name__}")
+        kind = self._basis_name_kind()
+        if member.name_kind != kind:
+            raise ValueError(f"{what}: this volume's members name_kind {kind!r}, got {member.name_kind!r}")
+        refused = validate_path(member.path)
+        if refused is not None:
+            raise ValueError(f"{what}: {refused}")
+
+    def _basis_target(
+        self, members: Sequence[BasisMember], rel: str, expected_target_version: int
+    ) -> BasisMember:
+        """The target as the commit describes it: the member ``rel`` names,
+        which must be at ``expected_target_version``, else ``rel`` at that
+        version. Refused with the coordinator's text where it answers 400."""
+        refused = validate_path(rel)
+        if refused is not None:
+            raise ValueError(f"target: {refused}")
+        try:
+            described = BasisMember(rel, expected_target_version, None, self._basis_name_kind())
+        except ValueError as exc:
+            raise ValueError(f"target: {exc}") from None
+        target_row = (rel, self._basis_key(rel), None)
+        for member in members:
+            if _names_one_row(target_row, (member.path, self._basis_key(member.path), member.registration)):
+                if member.version != described.version:
+                    raise ValueError(
+                        "target names a basis member but disagrees with its path, version or registration"
+                    )
+                return member
+        return described
+
     def atomic_publish(
         self,
         writes: Sequence[tuple[str | os.PathLike[str], int, bytes | bytearray | str]],
@@ -4765,7 +5302,9 @@ class CoherentVolume:
         failure envelope does (#433). A 404 on a snapshot-session or handoff
         route raises :class:`~ccs.core.exceptions.CoherenceError` naming the
         route, in both modes: a coordinator answers 404 only for a route it
-        does not serve, so nothing ran. Any other status follows ``on_error``.
+        does not serve, so nothing ran. A 404 on a basis route raises
+        :class:`~ccs.core.exceptions.BasisCheckAbsent` the same way. Any other
+        status follows ``on_error``.
 
         Every raise for a rejected request happens OUTSIDE the ``except``
         block, so the ``HTTPError`` never rides the raised error's chain: its
@@ -4823,6 +5362,11 @@ class CoherentVolume:
             # The coordinator answered, and nothing ran: neither a degradation
             # nor an outcome left unknown, in either mode.
             raise CoherenceError(_route_not_served_message(endpoint_path))
+        if status == 404 and endpoint_path in _BASIS_ROUTES:
+            # The same, typed: a caller that needs the basis check must be
+            # told the coordinator cannot give it, never a silence it could
+            # read as unchanged.
+            raise BasisCheckAbsent(_basis_route_not_served_message(endpoint_path))
         message = f"coordinator request to {endpoint_path} failed: HTTP {status}"
         if typed and commit_leg and status >= 500:
             # A 5xx says nothing of whether the commit ran: the coordinator's
@@ -4978,7 +5522,12 @@ class CoherentVolume:
             return result.data, result.version, result.owner_generation
 
     def _read_with_version(
-        self, rel: str, *, observe: bool = True, advance_baseline: bool = True
+        self,
+        rel: str,
+        *,
+        observe: bool = True,
+        advance_baseline: bool = True,
+        want_registration: bool = False,
     ) -> _ReadResult:
         """OCC helper: register a SHARED view and return
         ``(bytes, version, stale_denied, owner_generation, stale_status,
@@ -5016,6 +5565,10 @@ class CoherentVolume:
         ``owner_generation`` rides the same fail-closed discipline: ``None``
         when the coordinator did not confirm one (older coordinator, deny,
         degraded), which generation-aware callers treat as UNCONFIRMED.
+
+        ``want_registration`` asks the coordinator for the registration of the
+        row the version was read from (:meth:`read_for_basis`). Off, the
+        request is the one every other read sends, unchanged.
         """
         self._ensure_attached()
         abs_path, _rel = self._to_relative(rel)
@@ -5039,6 +5592,8 @@ class CoherentVolume:
         stale_status = False
         content_differs = False
         owner_generation: int | None = None
+        registration_reported = False
+        registration: str | None = None
         # This read's answer replaces both: its handoff key and whether it was
         # a strict deny. An unanswered or failed read leaves neither set.
         self._read_handoffs.pop(key, None)
@@ -5046,30 +5601,31 @@ class CoherentVolume:
         self._last_read_split = False
         if self._endpoint is not None:
             reader = self._incarnation  # the incarnation this request names
-            resp = self._post(
-                "/hooks/pre-read",
-                {
-                    "session_id": self._session_id,
-                    "path": _rel,
-                    "content_hash": content_hash,
-                    # Opt-in: ask for the pair-consistent (version,
-                    # owner_generation). Older coordinators ignore the flag and
-                    # answer without the key (generation stays None).
-                    "want_owner_generation": True,
-                    # A verification read (``observe=False`` -- the effect
-                    # fence re-reading only to compare comparands) must not
-                    # MUTATE coordinator grant state: re-granting SHARED here
-                    # would heal the very grant loss the fence is checking, so
-                    # the caller stays whatever it was (INVALID after a
-                    # preemption), and a bare re-check re-HOLDs instead of
-                    # admitting. The client-side ``observe`` already keeps the
-                    # foreign-edit baseline still; this carries the same
-                    # "verification is not observation" rule to the server.
-                    # Older coordinators ignore it (edge-triggered fallback,
-                    # still fail-closed on the first check).
-                    "verify_only": not observe,
-                },
-            )
+            request = {
+                "session_id": self._session_id,
+                "path": _rel,
+                "content_hash": content_hash,
+                # Opt-in: ask for the pair-consistent (version,
+                # owner_generation). Older coordinators ignore the flag and
+                # answer without the key (generation stays None).
+                "want_owner_generation": True,
+                # A verification read (``observe=False`` -- the effect
+                # fence re-reading only to compare comparands) must not
+                # MUTATE coordinator grant state: re-granting SHARED here
+                # would heal the very grant loss the fence is checking, so
+                # the caller stays whatever it was (INVALID after a
+                # preemption), and a bare re-check re-HOLDs instead of
+                # admitting. The client-side ``observe`` already keeps the
+                # foreign-edit baseline still; this carries the same
+                # "verification is not observation" rule to the server.
+                # Older coordinators ignore it (edge-triggered fallback,
+                # still fail-closed on the first check).
+                "verify_only": not observe,
+            }
+            if want_registration:
+                # Sent only when asked, so every other read's request is unchanged.
+                request["want_registration"] = True
+            resp = self._post("/hooks/pre-read", request)
             self._note_read_handoff(_rel, resp)
             if isinstance(resp, dict):
                 if resp.get("degraded"):
@@ -5103,8 +5659,12 @@ class CoherentVolume:
                 # coordinator not to register one, so it records nothing.
                 if observe and self._read_registered(resp):
                     self._read_incarnations[key] = reader
+                if want_registration and "registration" in resp:
+                    registration_reported = True
+                    registration = _wire_str(resp, "registration")
         result = _ReadResult(
-            data, version, stale_denied, owner_generation, stale_status, content_differs
+            data, version, stale_denied, owner_generation, stale_status, content_differs,
+            registration_reported=registration_reported, registration=registration,
         )
         self._last_read_split = result.split_pair
         # SB-23: the OCC read path also advances the foreign-edit baseline — but

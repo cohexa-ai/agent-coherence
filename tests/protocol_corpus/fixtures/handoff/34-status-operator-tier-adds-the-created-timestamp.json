@@ -84,6 +84,8 @@
       "detail": "full",
       "effect_fence_holds_total": 0,
       "endpoint_counters": {
+        "basis_check_total": 0,
+        "basis_commit_total": 0,
         "effect_fence_total": 0,
         "handoff_accept_total": 0,
         "handoff_decline_total": 0,
