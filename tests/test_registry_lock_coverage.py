@@ -267,9 +267,10 @@ EXEMPT_MEMBERS = frozenset({
 # enrolling it runs it through the lock check.
 INMEM_SURFACE = frozenset({
     "abort_guard", "adjust_checkpoint_pin_refcount", "all_session_meta",
-    "artifact_ids", "bind_caller_principal", "capture_version_vector",
+    "artifact_ids", "basis_rows", "bind_caller_principal", "capture_version_vector",
     "claim_checkpoint_registration", "clear_agent_transient",
-    "commit_all", "commit_cas", "conflict_outcome_totals", "coordinator_epoch",
+    "commit_all", "commit_cas", "commit_cas_if_basis", "conflict_outcome_totals",
+    "coordinator_epoch",
     "artifacts_with_detection_edge", "clear_detection_edges",
     "close_detection_run", "create_checkpoint", "detection_runs",
     "detection_uncoverable", "evict_transfer_records", "foreign_write_totals",
@@ -389,6 +390,15 @@ def _synth_value(param: inspect.Parameter):
         )}
     if name == "read_set":
         return [uuid4()]
+    if name == "basis":
+        # A mapping of id -> expected version, which the basis commit
+        # validates before its lock: an id alone never reaches the hold.
+        return {uuid4(): 1}
+    if name == "registrations":
+        # Parsed as UUIDs before the lock, the same shape as `basis`.
+        return [str(uuid4())]
+    if name == "names":
+        return ["synth.md"]
     if name == "abort":
         return None
     if "UUID" in ann or name.endswith("agent_id") or name.endswith("artifact_id") or name == "owner":

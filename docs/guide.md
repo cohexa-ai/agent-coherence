@@ -35,26 +35,27 @@ full command-line toolset, and the API reference.
 15. [Workspace versioning & restore (`WorkspaceVersioner`)](#workspace-versioning--restore-workspaceversioner)
 16. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
 17. [Effect fence over HTTP](#effect-fence-over-http)
-18. [Caller principal](#caller-principal)
-19. [Targeted grant handoff](#targeted-grant-handoff)
-20. [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)
-21. [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)
+18. [Basis check](#basis-check)
+19. [Caller principal](#caller-principal)
+20. [Targeted grant handoff](#targeted-grant-handoff)
+21. [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)
+22. [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)
     - [Refusing a held strict file in Claude Code sessions](#refusing-a-held-strict-file-in-claude-code-sessions)
-22. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
-23. [Inline benchmark mode](#inline-benchmark-mode)
-24. [Telemetry](#telemetry)
-25. [Graceful degradation](#graceful-degradation)
-26. [Examples](#examples)
-27. [Real-workload benchmarks](#real-workload-benchmarks)
-28. [Benchmarking your own workload](#benchmarking-your-own-workload)
-29. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-30. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
-31. [Replay (v0.8.2+)](#replay-v082)
-32. [Command-line tools](#command-line-tools)
-33. [API reference](#api-reference)
-34. [Low-level adapter API](#low-level-adapter-api)
-35. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-36. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+23. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
+24. [Inline benchmark mode](#inline-benchmark-mode)
+25. [Telemetry](#telemetry)
+26. [Graceful degradation](#graceful-degradation)
+27. [Examples](#examples)
+28. [Real-workload benchmarks](#real-workload-benchmarks)
+29. [Benchmarking your own workload](#benchmarking-your-own-workload)
+30. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
+31. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
+32. [Replay (v0.8.2+)](#replay-v082)
+33. [Command-line tools](#command-line-tools)
+34. [API reference](#api-reference)
+35. [Low-level adapter API](#low-level-adapter-api)
+36. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+37. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -661,11 +662,11 @@ What the software does not do, in one place: a list of limits, then [when each g
 - **Races need compare-and-swap.** A plain `write()` does not settle a race between two writers, and `write_cas` does ([scope](../README.md#coherent-workspace-the-data-plane-for-shared-files)). A known defect is open: a plain `write()` made after a peer's `write_cas_at` commits, and before the peer's bytes reach disk, can be lost while both calls report success ([#248](https://github.com/Cohexa-ai/agent-coherence/issues/248)).
 - **Read side only for the framework stores.** `CCSStore` and the CrewAI, AutoGen and OpenAI Agents SDK adapters keep readers current inside one process. They do not refuse a write built from an old read. For that, write through `CoherentVolume` or `write_cas` ([RAG and shared memory](../README.md#rag--shared-agent-memory)).
 - **No rollback.** `gate()` can hold an action before it fires. It checks just before the action, not while it runs, so it narrows that window and does not close it ([scope](#gatevolume-path--decide-effect)). It cannot undo an action, and [workspace restore](#workspace-versioning--restore-workspaceversioner) can put back a file or an object, not an action that already ran.
-- **No check of an earlier approval's inputs.** `gate()`, `swg_gate` and `POST /hooks/effect-fence` check one input per call, and a [snapshot session](#multi-artifact-snapshot-sessions) pins its inputs when it begins. No call takes the versions a review or approval read earlier, across several inputs, and checks them all at one instant without rewriting them. That check is proposed in [#653](https://github.com/Cohexa-ai/agent-coherence/issues/653) and is not shipped.
+- **An approval's inputs are checked at one instant, not held.** `gate()`, `swg_gate` and `POST /hooks/effect-fence` check one input per call, and a [snapshot session](#multi-artifact-snapshot-sessions) pins its inputs when it begins. The [basis check](#basis-check) takes the versions a review or approval read earlier, up to 64 inputs, and checks them all at one instant without rewriting them, and its commit form writes one file only while they all hold. A `proceed` is true at that instant only: an input can move right after it, and an act other than that one commit is not atomic with the check. It compares versions and registrations, not content or grants, and only the Python coordinator serves it ([limits](#what-the-basis-check-does-not-do)).
 - **Recovery is the agent's.** Over MCP a refusal carries a `recover` verb and often a `next_step`, and in Python it is a typed exception ([MCP server](#stale-write-guard-fs-mcp-server)). The agent then re-reads, rebuilds its change and retries, and nothing here merges content or rebuilds a change for it. `CoherentVolume.write_cas` does retry inside the call, but each retry only runs your `make_content` again on the current bytes, so the rebuild is still your code ([details](#concurrent-writers-write_cas)).
 - **No verdict on the work.** It checks that what an agent read is still current. It does not judge whether the result is right or the task is done.
-- **Claude Code warns by default.** The Claude Code hooks deny a session whose copy of a file went stale only in strict mode, on the files you opt in ([details](#after-a-strict-mode-stale-deny)). By default, if the coordinator is overloaded or does not answer, the hook lets the call through, in strict mode too ([#223](https://github.com/Cohexa-ai/agent-coherence/issues/223)). By default the hooks also do not settle two sessions editing one file at the same time: the later edit is admitted with a note ([details](#acquire-or-fail-on-pre-edit)).
-- **Python, or MCP.** The library is Python 3.11+. An agent in another language reaches it through the [MCP server](#stale-write-guard-fs-mcp-server), or the [HTTP effect fence](#effect-fence-over-http) on the same host, and there is no TypeScript or Go SDK. The Claude Code plugin ships its own Node coordinator, which has no caller principals, sweep, snapshot sessions or handoffs ([details](#a-volume-on-the-node-coordinator)).
+- **Claude Code warns by default.** The Claude Code hooks deny a session whose copy of a file went stale only in strict mode, on the files you opt in ([details](#after-a-strict-mode-stale-deny)). By default, if the coordinator is overloaded or does not answer, the hook lets the call through, in strict mode too ([#223](https://github.com/Cohexa-ai/agent-coherence/issues/223)); for an Edit or Write sent to a running coordinator, this package's hook client (`agent-coherence-hook-client`) also tells the model the check did not run, and the plugin's Node hook client does not ([details](#when-a-claude-code-edit-gets-no-answer)). By default the hooks also do not settle two sessions editing one file at the same time: the later edit is admitted with a note ([details](#acquire-or-fail-on-pre-edit)).
+- **Python, or MCP.** The library is Python 3.11+. An agent in another language reaches it through the [MCP server](#stale-write-guard-fs-mcp-server), or the [HTTP effect fence](#effect-fence-over-http) on the same host, and there is no TypeScript or Go SDK. The Claude Code plugin ships its own Node coordinator, which has no caller principals, sweep, snapshot sessions, handoffs or basis check ([details](#a-volume-on-the-node-coordinator)).
 - **`ccs-diagnose` only reports.** It observes one run of one LangGraph graph in one process and reports reads that were handed different versions. It denies no read and no write, and it cannot see divergence across separate OS processes ([reference](ccs-diagnose.md)).
 - **No dashboard.** Nothing here shows a running fleet: there is no web UI and no live chart of coordinator state. You read typed results and what the `agent-coherence-status` command prints for either coordinator ([status](#status-track-and-untrack-commands)), and `CCSStore` can send per-operation metrics to OpenTelemetry or LangSmith ([telemetry](#telemetry)). The pages and charts that exist are static files: an HTML report from `ccs-diagnose`, `ccs-simulate` or `ccs-compare`, and the benchmark curve that `tools/plot_cost_sweep.py` draws. Counters exist on the Python coordinator only: in `/status`, and in its `state.db`, which you read offline ([conflict-outcome counters](#conflict-outcome-counters--how-often-did-it-actually-fire), [foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)).
 - **Not a security boundary.** It guards against accidents between your own agents, not against a hostile process. One bearer secret covers every process in the workspace, and a [caller principal](#caller-principal) is not authentication ([security notes](security.md)).
@@ -684,6 +685,7 @@ Each row is a case the software guards, what happens on each surface, and the co
 | Someone edits a file by hand in the workspace while an agent is still working from the old copy, and the agent saves over the edit. | By default `CoherentVolume.write()` raises `StaleView` and `swg_write` answers `stale_view`. The hand edit stays on disk, and the refusal tells the agent to reacquire and rebuild its change from the fresh bytes. | The file is a managed path on the same machine. The agent read it through `CoherentVolume` or the MCP tools before the edit, and writes it the same way. The edit is caught at the agent's next write, not as it happens. The Claude Code hooks do not deny this save. They admit it with a notice. |
 | A background pass rewrites a memory file while a running agent still holds the earlier version. | One commit lands first, and the other is not applied over it. `write_cas_at` raises `CasVersionConflict` and the MCP `swg_write_cas` answers `version_mismatch`, and the agent re-reads and retries. `write_cas` reads the file itself, so the agent's `make_content` runs on the current bytes. | Both sides commit with compare-and-swap on a managed file, and each builds its content from the bytes that call or its read returned. On a path outside the managed globs a compare-and-swap checks no version and the later commit lands. |
 | Two agents race on one file. | One commit wins. `write_cas_at` and the MCP `swg_write_cas` refuse the other with a typed error: a version conflict, or `ViewWedged` while the winner's bytes are still reaching disk. `write_cas` retries the loser itself, running `make_content` again on the winner's bytes for at most nine commit attempts, then raises `CasRetriesExhausted`. | Both write with compare-and-swap on a managed file. A plain `write()` does not settle a race, and by default neither do the Claude Code hooks. |
+| A review or an approval reads several files, records what it read, and is acted on later, perhaps from another process, after a peer edited some of them. | `check_basis` and `POST /basis/check` hold and name every input that moved, with the version it was read at, its version now and why. `commit_if_basis` and `POST /basis/commit` hold and write nothing. With nothing moved, the commit writes only its target, so other readers' recorded versions stay current. | The inputs were read through the coordinator and recorded with their versions and registrations (`read_for_basis`, or a pre-read with `want_registration`), the writers commit through the coordinator, and the Python coordinator serves the check. A `proceed` is true at its instant only, so when the act is a file write, use the commit form. Versions only: a byte-identical re-save holds, and a sweep's reclaim of a grant does not ([details](#basis-check)). |
 
 ### When you do not need this
 
@@ -1363,6 +1365,7 @@ library:
 | `POST /hooks/post-edit` (`success: true`) | two top-level keys on the not-held refusal (below) and on the `stale_read_generation` refusal |
 | `POST /session/commit` | two top-level keys beside `reason` and `current_version` |
 | `POST /session/commit_all` | two keys inside each `per_artifact` member, for each artifact the committer has a claim on |
+| `POST /basis/commit` | two keys inside the `target` block of a refused commit, beside `reason` and `current_version` (see [The target block](#the-target-block)); in Python, `TargetRefusal` attributes |
 | `ConflictDetail`, `StaleReadGeneration`, `CommitNotAllowed` | attributes, in process: `CoordinatorService.commit_cas` returns a `ConflictDetail`, and `commit_all` a `MultiCommitConflict` with one in `per_artifact` per member |
 | `CasVersionConflict`, `CasRetriesExhausted`, `CommitPreempted` | attributes; see [Concurrent writers](#concurrent-writers-write_cas) |
 | the MCP server's `swg_write` | `structuredContent` keys on `commit_preempted`; see [the MCP server](#stale-write-guard-fs-mcp-server) |
@@ -1723,7 +1726,7 @@ with CoherentVolume(workspace_root, managed=("plans/**",)) as vol:
 |---|---|---|
 | `workspace_root` | — | Directory the volume manages; the coordinator's state lives in `<root>/.coherence/` |
 | `managed` | `()` | Glob patterns for the files under coordination; unmanaged paths bypass the volume |
-| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A `.coherence` that a start refuses raises `CoherenceDirRefused` instead, which no retry clears; see [`.coherence` must be a real directory](#coherence-must-be-a-real-directory). A policy file a start cannot load, lock or write raises `PolicyFileRefused`, which no retry clears either; see **Policy files** under [Status, track and untrack commands](#status-track-and-untrack-commands). A read the coordinator answers with its failure envelope raises `CoordinatorFailed`, and so does the release of a write grant an earlier `write()` left held, every request that commits nothing answered with an HTTP 5xx, a commit refused by the volume's own unreleased write grant, and a refuse-mode grant request the coordinator could not decide in time; see [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
+| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure, except in the basis calls: `read_for_basis`, `check_basis` and `commit_if_basis` raise in both modes, because a basis nobody confirmed is never taken for unchanged (see [Basis check](#basis-check)). In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A `.coherence` that a start refuses raises `CoherenceDirRefused` instead, which no retry clears; see [`.coherence` must be a real directory](#coherence-must-be-a-real-directory). A policy file a start cannot load, lock or write raises `PolicyFileRefused`, which no retry clears either; see **Policy files** under [Status, track and untrack commands](#status-track-and-untrack-commands). A read the coordinator answers with its failure envelope raises `CoordinatorFailed`, and so does the release of a write grant an earlier `write()` left held, every request that commits nothing answered with an HTTP 5xx, a commit refused by the volume's own unreleased write grant, and a refuse-mode grant request the coordinator could not decide in time; see [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
 | `on_held` | `"displace"` | `"refuse"` — on a managed path, raise `OtherHolder` instead of taking a file another agent holds; see [Refusing a file another agent holds](#refusing-a-file-another-agent-holds) |
@@ -2319,6 +2322,13 @@ coordinator on its store, which refuses it.
   either `on_error`: nothing ran, and a retry gets the same answer. The volume
   stays attached and is not counted degraded. A single-file `atomic_publish`
   takes the direct compare-and-swap path and lands there.
+- **No basis check.** The Node coordinator does not serve `/basis/check` or
+  `/basis/commit`, and its pre-read never reports a registration. So
+  `read_for_basis` raises `BasisCheckAbsent` (the read is answered with no
+  registration), and `check_basis` and `commit_if_basis` raise it on the
+  route's `404`, under either `on_error`: nothing ran, and a retry gets the
+  same answer. The volume stays attached and is not counted degraded. Silence
+  is never taken for unchanged (see [Basis check](#basis-check)).
 - **`gate()` always holds.** The Node coordinator reports no ownership
   generation, so `gate()` can never confirm the grant leg and holds every time
   (see **Fail-closed comparands** under
@@ -2363,9 +2373,10 @@ files** under
 
 A commit is different, because its request may have reached the coordinator
 before the answer was lost. When the CAS of `write_cas` or `write_cas_at`, the
-commit of `atomic_publish`, or the post-edit of a plain `write()` was sent and
-got no usable answer, the volume raises `CommitUnconfirmed`: the commit may or
-may not have landed, so re-read before retrying a compare-and-swap (a plain
+commit of `atomic_publish` or `commit_if_basis`, or the post-edit of a plain
+`write()` was sent and got no usable answer, the volume raises
+`CommitUnconfirmed`: the commit may or may not have landed, so re-read before
+retrying a compare-and-swap (a plain
 `write()` recovers differently; see below). When the request never left,
 because the connection was refused, it raises `CoordinatorUnreachable`.
 A commit the coordinator answers with an HTTP `5xx` raises `CommitUnconfirmed`
@@ -2423,8 +2434,8 @@ nothing.
 
 `agent-coherence-coordinator --prepare-for-migration` stops the coordinator
 after a drain. Until the requests already under way finish, a few seconds at
-most, it refuses the commit of `write_cas`, `write_cas_at` and
-`atomic_publish` with `503` before any work runs. A strict commit raises
+most, it refuses the commit of `write_cas`, `write_cas_at`, `atomic_publish`
+and `commit_if_basis` with `503` before any work runs. A strict commit raises
 `CommitUnconfirmed`, as on any `5xx`, but here nothing landed, and a re-read
 shows the file as it was. A retry meets the same `503` until the drain ends;
 then the coordinator stops and the call raises `CoordinatorUnreachable`. So do
@@ -2434,7 +2445,11 @@ request, with `CoordinatorFailed`, and writes nothing.
 Reads, and the post-edit of a `write()` already under way, are still answered.
 
 `on_error="degrade"` is unchanged: it warns once, counts every failure and
-falls back to plain IO.
+falls back to plain IO. The basis calls are the exception: `read_for_basis`,
+`check_basis` and `commit_if_basis` raise in both modes, since a basis nobody
+confirmed is never taken for unchanged, and a `commit_if_basis` whose request
+may have arrived raises `CommitUnconfirmed`, as a compare-and-swap does (see
+[Basis check](#basis-check)).
 
 ### When the coordinator answers with a failure
 
@@ -2448,19 +2463,23 @@ may have recorded the commit before the error.
 - **A strict read raises `CoordinatorFailed`**, a `CoherenceError` whose
   `reason` is `coordinator_failed` (import it from `ccs.core.exceptions`). That
   covers `read()`, `read_with_version()`, `read_with_version_generation()`,
-  `reacquire()`, and the reads that `write_cas`, `write_cas_at` and `gate()`
-  make. The read is not confirmed as registered. Retry it once after a few
+  `read_for_basis()`, `reacquire()`, and the reads that `write_cas`,
+  `write_cas_at` and `gate()` make. The read is not confirmed as registered. Retry it once after a few
   seconds; if it fails again, report the coordinator as failing. A
   `CoordinatedSubstrate` raises the same type from `read()`, `reacquire()` and
   the check `commit()` makes before its substrate write. `on_error="degrade"` is
-  unchanged: it warns once, counts, and returns the bytes at version 0.
+  unchanged: it warns once, counts, and returns the bytes at version 0, except
+  `read_for_basis()`, which raises `CoherenceError` after the warning rather
+  than record a member at no version. `check_basis()` answered this way raises
+  `CoordinatorFailed` in both modes: nothing was checked, so retry it once.
 - **A commit raises `CommitUnconfirmed`** in both modes, because whether it
   landed is unknown. That covers the CAS of `write_cas` and `write_cas_at`, the
-  batch of `atomic_publish`, and the post-edit of a plain `write()`. Re-read,
-  and judge by the content you read back, not the version: `write_cas`,
-  `write_cas_at` and `atomic_publish` write disk only after a confirmed
-  commit, so a commit the coordinator recorded moves the version while the old
-  bytes are still on disk. A plain `write()` has already put its bytes on disk;
+  batch of `atomic_publish`, the commit of `commit_if_basis`, and the post-edit
+  of a plain `write()`. Re-read, and judge by the content you read back, not
+  the version: `write_cas`, `write_cas_at`, `atomic_publish` and
+  `commit_if_basis` write disk only after a confirmed commit, so a commit the
+  coordinator recorded moves the version while the old bytes are still on
+  disk. A plain `write()` has already put its bytes on disk;
   its error says so, and it first releases its grant, as it does when a commit
   gets no answer. Recover it as you would that write: re-reading does not clear
   the refusal of a path whose bytes the coordinator did not record, and writing
@@ -2677,7 +2696,10 @@ edit as before, because no coordinator is known that could hold the file; a
 coordinator shown gone (the lock free, for a `backend=node` file only once its
 pid no longer runs), a file it cannot read, and a link or anything but a pid
 file deny the edit. Every other hook event, and that edit with the refusal
-off, sends nothing and prints `{}` in all of these cases, as before.
+off, sends nothing and prints `{}` in all of these cases, as before. With the
+refusal off, a coordinator that exits after this check, while a `pre-edit` is
+under way, leaves that edit with the could-not-verify advisory instead (see
+[When a Claude Code edit gets no answer](#when-a-claude-code-edit-gets-no-answer)).
 
 A strict `CoherentVolume` raises the refusal as `CoordinatorUnreachable`, or as
 `CommitUnconfirmed` from a handoff verb; a degrade volume warns and counts a
@@ -2715,6 +2737,61 @@ list is in [A process on the coordinator's port](security.md#who-the-coordinator
 
 A remote coordinator has no pid file on this host and no such check; reach it
 over verified TLS.
+
+### When a Claude Code edit gets no answer
+
+A Claude Code hook never blocks a tool call because the coordinator failed. On
+a failure the hook client prints `{}`, and Claude Code goes on as if no hook
+had run. A `pre-edit`, from an Edit or a Write, says more in one case: when it
+was sent to a running coordinator (one that holds the workspace lock; see
+[A client sends nothing to a coordinator that exited](#a-client-sends-nothing-to-a-coordinator-that-exited))
+and no decision came back. Then the client prints the could-not-verify
+advisory, as added context only:
+
+```json
+{"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "\u26a0 Coherence could not verify this file's freshness \u2014 the coordinator staleness check timed out under load. Proceeding WITHOUT a stale-read guarantee: if this file is shared with other agents or sessions, re-read it before relying on its contents."}}
+```
+
+The edit goes ahead. The answer carries no `permissionDecision`, so Claude
+Code asks about the edit exactly as it would if the hook had not answered, and
+the model is told the check did not run, in the words a hook uses when its
+check times out (see [When the registry is busy](#when-the-registry-is-busy)).
+
+| What happened to the `pre-edit` | What the hook prints |
+|---|---|
+| The coordinator answered with a JSON object, a refusal included | that answer, as before |
+| The coordinator answered `200` with its failure envelope, `{"ok": false, "reason": "internal: <type>"}`: its handler raised before deciding, as when its store stayed locked past its wait | the advisory |
+| HTTP `5xx`: every handler busy, a failure inside the coordinator (`500`), a coordinator stopping or draining for a migration (`503`) | the advisory |
+| The connection was reset or closed early, the answer was cut short, no answer came within the client's timeout, or the coordinator never accepted the connection | the advisory |
+| Nothing listens on the port (the connection is refused) | `{}` |
+| No coordinator is known, or one is shown gone, before anything is sent | `{}` |
+| HTTP `4xx`, or a redirect | `{}` |
+| An empty or non-JSON `2xx` answer | `{}` |
+| The caller principal is refused and recovery cannot cure it | `{}`, with the stderr line it always wrote |
+
+- The advisory says the check "timed out under load" whichever of these
+  failures it reports: a `500`, a failure envelope, a reset and a stopping
+  coordinator get the same words.
+- A coordinator that exits while the request is under way gives the advisory,
+  even when it stops cleanly: the check before the send cannot see an exit
+  that comes after it.
+- The client waits up to 6 seconds for each request. Until a claim of the
+  session's caller principal is confirmed, a hook sends two, the claim and then
+  its own request, and against a coordinator that accepts connections and
+  never answers no claim is ever confirmed. So there every edit costs up to 12
+  seconds, and Claude Code's timeout for the hook must be longer than that for
+  the advisory to reach the model. A hook that Claude Code stops first shows
+  the model nothing.
+- Nothing is retried
+  ([#414](https://github.com/Cohexa-ai/agent-coherence/issues/414)).
+- Every other hook event (Read, Bash, Grep, the edit's PostToolUse, session
+  start and stop) still prints `{}` on all of these failures, and so does the
+  plugin's Node hook client for an edit
+  ([#223](https://github.com/Cohexa-ai/agent-coherence/issues/223)).
+- With the
+  [refusal of held strict files](#refusing-a-held-strict-file-in-claude-code-sessions)
+  on, the edit of a strict path keeps its own answers: any failure after a
+  coordinator is known denies it with the unavailable deny.
 
 ### Atomic multi-file publish: `atomic_publish` (v0.12.0+)
 
@@ -3552,8 +3629,8 @@ snapshot, so the pair always describes the same state.
   again, and capture and fence under the new `agent_id`, as
   `CoherentVolume.reacquire()` does. Keeping the `session_id` keeps a claimed
   caller principal valid. Only a Claude Code hook read, which sends none of
-  `want_owner_generation`, `verify_only` and `name_kind`, is admitted after one
-  deny; see [After a strict-mode stale deny](#after-a-strict-mode-stale-deny).
+  `want_owner_generation`, `verify_only`, `name_kind` and `want_registration`,
+  is admitted after one deny; see [After a strict-mode stale deny](#after-a-strict-mode-stale-deny).
 - **Make a hashed pre-read the file's first touch.** The coordinator records a
   file's content claim from the hash on the pre-read that first registers the
   file. A file first registered some other way holds no claim: by a pre-read
@@ -3711,6 +3788,564 @@ version lets that gate fire where this fence holds. It is in-process Python
 only — no HTTP route and no tool reaches it — and it answers in its own
 fired/held result types, not in the vocabulary above.
 
+## Basis check
+
+A check, a review or an approval reads several shared files, records what it
+read, and is acted on later, sometimes from another process. Before the act
+lands it needs one answer: is every input still the version it read? A
+**basis** is that record. For each input it names the path, the version read,
+and the registration of the record the read came from.
+
+- `check_basis` answers `proceed` or `hold` for the whole basis at one instant.
+  A hold names every input that moved, the version it was read at, its version
+  now, and why.
+- `commit_if_basis` writes one target by compare-and-swap only while the whole
+  basis and the target's expected version are unchanged, in that same instant.
+  It never rewrites the other inputs, so every other reader's recorded versions
+  stay current.
+
+Both are offered in process (`CoordinatorService`), over HTTP on the Python
+coordinator (`POST /basis/check` and `POST /basis/commit`), and on
+`CoherentVolume`. The Claude Code plugin's Node coordinator serves neither; see
+[What the basis check does not do](#what-the-basis-check-does-not-do).
+
+The other guards answer a different question:
+
+| Guard | Why it does not answer this one |
+|---|---|
+| `gate()`, `swg_gate`, `POST /hooks/effect-fence` | one input per call, and `gate()` captures the version at its own call, after an earlier edit |
+| one fence call per input | the first hold ends the loop, so it names only the first moved input; it also consults grant state, so a record written only by compare-and-swap needs a reacquire first |
+| a [snapshot session](#multi-artifact-snapshot-sessions) | pins its inputs when it begins, not when the check read them |
+| `atomic_publish` over every input | holds on a moved input, but rewrites every input when it lands, which makes every other reader's recorded versions stale |
+
+`python -m examples.basis_gate.stale_check` and
+`python -m examples.basis_gate.stale_approval` run each of these against a peer
+that edits two inputs between the read and the act (offline, no keys; see
+[`examples/basis_gate/README.md`](../examples/basis_gate/README.md)).
+
+### Recording a basis
+
+```python
+from ccs.adapters import CasCommitResult, CoherentVolume
+from ccs.core.basis import BasisMember
+
+vol = CoherentVolume(root, managed=("tasks/**",))
+
+# Record: the bytes, and a member naming the path, the version and the registration read.
+plan, plan_member = vol.read_for_basis("tasks/plan.md")
+budget, budget_member = vol.read_for_basis("tasks/budget.md")
+approvals, approvals_version = vol.read_with_version("tasks/approvals.md")
+basis = [plan_member, budget_member]
+
+# A member is plain data: hand it to another process and rebuild it there.
+fields = [member.to_wire() for member in basis]
+basis = [BasisMember(**member) for member in fields]
+
+# Later: are they all still what was read?
+answer = vol.check_basis(basis)
+if answer.answer == "hold":
+    for moved in answer.moved:  # every moved input, not just the first
+        print(moved.path, moved.expected, moved.current, moved.reason)
+    # answer.recovery: "rederive" (read again and redo the work) or "retry"
+
+# Or land the result only while they all are, built from the bytes recorded above.
+outcome = vol.commit_if_basis(basis, "tasks/approvals.md", approvals_version,
+                              approvals + b"approved\n")
+if isinstance(outcome, CasCommitResult):
+    print("committed at version", outcome.version)
+```
+
+`BasisMember(path, version, registration=None, name_kind="file")`, from
+`ccs.core.basis`, is frozen and checked when it is built: `path` is a non-empty
+string; `version` is an integer from 1 to 9223372036854775807, never a `bool`
+and never `0`, the "could not resolve" sentinel; `registration` is a UUID, as a
+`UUID` or a string, kept in canonical dashed form; `name_kind` is `"file"` or
+`"key"`. A member that could only hold is never built. Its four fields are its
+wire form: `to_wire()` returns them as a dict, and `BasisMember(**fields)` or
+`BasisMember.from_wire(fields)` builds the member again.
+
+**The registration** is an opaque string that changes when the path's record
+is registered again. A path that is deleted and registered again restarts at
+version 1, so without it a member recorded at version 1 before the delete would
+match the new record. On the Python coordinator it is the record's id: the
+coordinator gives every record it registers a new id, so a delete followed by a
+new registration, a store reset, or a merge of one file's spellings at start
+gives the path a new one. In process on the in-memory registry it is a token
+minted at every `register_artifact`, including one that replaces a record under
+the same id, as `CCSStore` does when it writes a deleted key again.
+
+**On `CoherentVolume`**, `read_for_basis(path)` returns the bytes and a member
+naming the path as the volume resolved it, the version the coordinator
+confirmed, and the registration of the record it read. A remote volume records
+its members as keys (`name_kind="key"`), every other volume as files, and a
+volume refuses a member of the other kind. It never returns a member that could
+only hold: it raises, in both `on_error` modes, checked in this order:
+
+1. no coordinator attached, an answer that confirms nothing (no answer, a
+   `degraded` answer, the failure envelope), or no version because the file is
+   not tracked: `CoherenceError` (a strict read raises its own typed error for
+   the failure first);
+2. a strict-mode refusal: `StaleView`; `reacquire()` and read again;
+3. bytes that are not the content the coordinator records at that version: the
+   split-pair `StaleView`, whose `reason` is `split_pair`;
+4. an answer with no registration: `BasisCheckAbsent`, because the coordinator
+   does not serve the basis check;
+5. a `null` registration: `CoherenceError` saying the coordinator holds no
+   content for the file yet. Reading again does not change that. A commit of
+   the file through the coordinator (`write()`, `write_cas` or `write_cas_at`)
+   records its content, and a read after that commit records the member.
+
+The bytes become the volume's foreign-edit baseline only once every check
+passed. `read_with_version` and `read_with_version_generation` are unchanged.
+
+**In process**, `CoordinatorService.basis_member(artifact_id)` records a
+member. It returns a `BasisMemberRead` (`ccs.coordinator.service`) read at one
+instant and granting nothing: `member`, with the record's name as its path;
+`content_hash`, the record's hash; and `content`, the stored body when the
+record has no hash or the body's hash is the recorded one, else `None`. The
+SQLite registry stores no body, so there `content` is always `None`. Act only on
+`content`, or on bytes whose hash is `content_hash`: on the in-memory registry a
+commit that passes only a hash leaves the previous body in place. An unknown id
+raises `CoherenceError`. In process every member needs its registration, since
+the service finds each member by it.
+
+**Over HTTP**, a pre-read that sets `"want_registration": true` reports the
+registration beside the version; see
+[Asking a pre-read for the registration](#asking-a-pre-read-for-the-registration).
+
+A member built by hand may leave the registration out over HTTP and on
+`CoherentVolume`. It is then compared by version only.
+
+### Checking a basis
+
+| Surface | Call | Returns |
+|---|---|---|
+| in process | `CoordinatorService.check_basis(basis, *, resolve=None, deadline=None)` | `BasisCheckAnswer` |
+| HTTP | `POST /basis/check` | the same answer as JSON |
+| `CoherentVolume` | `vol.check_basis(basis)` | `BasisCheckAnswer` |
+
+Every member is read and compared at one instant: under one hold of the
+service's session lock and then the registry lock, with every member's record
+read in one registry statement. The check is read-only and finds members by
+lookup only. It registers, grants and captures nothing; it leaves every
+version, content hash, ownership generation, agent state, transient, read
+generation and snapshot session as it was; and it does not consult grant
+state. A path nobody ever read holds, and no record is created for it.
+
+Two answers, the same on the wire and as `BasisCheckAnswer` (`ccs.core.basis`):
+
+```json
+{"answer": "proceed",
+ "checked": {"tasks/plan.md": {"expected": 4, "current": 4},
+             "tasks/budget.md": {"expected": 2, "current": 2}}}
+
+{"answer": "hold",
+ "moved": [{"path": "tasks/plan.md", "expected": 4, "current": 5, "reason": "version_moved"},
+           {"path": "tasks/budget.md", "expected": 2, "current": 3, "reason": "version_moved"}],
+ "recovery": "rederive"}
+```
+
+`proceed` carries every member's expected and current version
+(`answer.checked`, a tuple of `CheckedMember(path, expected, current)`).
+`hold` carries every moved member in request order, never only the first
+(`answer.moved`, a tuple of `MovedMember(path, expected, current, reason)`,
+whose `current` is `null`, or `None`, when there is no record), and the
+recovery class. A hold that compared nothing names no member and carries the
+reason and its class instead:
+
+```json
+{"answer": "hold", "moved": [], "reason": "version_unconfirmed", "recovery": "retry",
+ "degraded": true, "held_by": "watchdog_timeout"}
+```
+
+The field is called `answer` so that neither value reads as a verdict on the
+work, and a `proceed` is true at that instant only.
+
+**In process**, `check_basis` raises `ValueError` for an empty basis, more than
+64 members (`BASIS_MAX_MEMBERS`), a path or a registration named twice, or a
+member without its registration. `deadline` is a `time.monotonic()` instant
+that bounds the wait for each lock; past it `RegistryLockTimeout` is raised and
+nothing was read. `resolve` is how the coordinator's route finds members by
+path; an in-process caller leaves it unset.
+
+**On `CoherentVolume`**, silence is never taken for unchanged. In both
+`on_error` modes a detached volume raises `CoherenceError`, a coordinator
+without the route raises `BasisCheckAbsent`, the failure envelope raises
+`CoordinatorFailed`, and an answer the volume cannot classify, or a `proceed`
+that does not confirm every member at its recorded version, raises
+`CoherenceError`. No answer, or an HTTP `4xx` or `5xx`, raises as for any
+request in strict mode (`CoordinatorUnreachable`, `CoherenceError` or
+`CoordinatorFailed`), and raises `CoherenceError` after its warning in degrade
+mode. A check the coordinator could not compare in time comes back as the
+`version_unconfirmed` hold. A basis the coordinator would refuse as malformed
+raises `ValueError` before anything is sent, with the coordinator's own text.
+The check changes no read, baseline or handoff state in the volume.
+
+### Hold reasons and recovery
+
+This vocabulary answers its own question, "is every input still what I read?",
+not the effect fence's "may this effect still fire under the grant I read it
+with?", and it is not the fence's
+[published vocabulary](#hold-reasons--the-published-vocabulary). Three tokens
+are shared with the fence by value and mean the same thing there; two are its
+own; none of the fence's grant reasons arrive here. **`input_vanished` here
+excludes untracked paths**: the fence folds an untracked path into it, while a
+basis check reports it as `basis_member_unmanaged`, because the remedy differs.
+Match on the whole value, and treat a hold whose reason you do not recognise as
+a hold.
+
+| `reason` | What it means | `recovery` | What to do |
+|---|---|---|---|
+| `basis_member_unmanaged` | the coordinator's policy does not track the path now (HTTP and `CoherentVolume` only) | `rederive` | track the path again (see [track and untrack](#status-track-and-untrack-commands)) or leave it out of the inputs, then read again and redo the work |
+| `basis_member_replaced` | the path no longer names the record that was read: the registration differs, the version is below the recorded one, or, in process, the record read now carries another name, or is gone and another record carries its name | `rederive` | read the input again and redo the work |
+| `input_vanished` | there is no record for the path (in process, for the registration): it was never read through the coordinator, or it is gone | `rederive` | read the input through the coordinator, then redo the work |
+| `version_moved` | a commit moved the version since the read, a byte-identical re-save included | `rederive` | read the input again and redo the work |
+| `version_unconfirmed` | nothing was compared: the coordinator could not take its locks in time, its watchdog answered, or its handler failed | `retry` | send the same request again later |
+
+`rederive` means an input moved: read the inputs again, redo the work, and
+record a new basis. Checking the same basis again never clears it. `retry`
+means nothing is known to have moved, so the same request may succeed later.
+The closed set of reasons is `BASIS_HOLD_REASONS` in `ccs.core.exceptions`,
+and the map from reason to class is `BASIS_RECOVERY` in `ccs.core.basis`.
+
+Each moved member carries exactly one reason. When several apply, the first in
+this order is the answer: `basis_member_unmanaged`, `basis_member_replaced`,
+`input_vanished`, `version_moved`. `version_unconfirmed` belongs to the whole
+request, never to a member.
+
+### Committing under a basis
+
+| Surface | Call | Returns |
+|---|---|---|
+| in process | `CoordinatorService.commit_if_basis(basis, target, expected_target_version, content=None, *, agent_id, caller=None, content_hash=None, ...)` | `BasisCommitResult` |
+| HTTP | `POST /basis/commit` | the answer as JSON |
+| `CoherentVolume` | `vol.commit_if_basis(basis, target, expected_target_version, content)` | `CasCommitResult` on a win, `BasisCommitAnswer` on a hold |
+
+One hold covers the whole call. The members and the target are compared as
+`check_basis` compares them; the compare-and-swap's preconditions run; and the
+target's compare-and-swap compares the basis once more as it commits, inside
+its own transaction on SQLite. A peer's commit of a member cannot land between
+the basis compare and the target's write. Only the target is written, and no
+member moves. The commit never creates a target: an unregistered target holds
+`input_vanished`.
+
+**The target, inside or outside the basis.** The target is described like a
+member, at the version you expect it to be:
+
+- A target that names a member (the same path over HTTP and on the volume, two
+  spellings of one file included; the same path or registration in process) is
+  that member, and must agree with its version and registration. Otherwise the
+  request is malformed: HTTP `400`, or `ValueError`. One record never carries
+  two comparands.
+- A target outside the basis, such as an approvals file the approval did not
+  read as an input, is compared in the same hold and, on SQLite, the same
+  transaction. A moved or unresolvable target holds in `moved` with a member
+  reason, so you re-derive. Over HTTP and on the volume such a target carries
+  no registration and is compared by version only; list it as a member too to
+  have its registration compared. In process the target needs its
+  registration, like every member.
+
+**Answers.** Moves of the basis and refusals of the target stay apart:
+
+| Outcome | Answer | What to do |
+|---|---|---|
+| won | `{"answer": "proceed", "committed": {"path": "tasks/approvals.md", "version": 4}}`, plus the top-level [`handoff` key](#the-handoff-key) while the target has a transfer record | nothing |
+| a member or the target moved | `hold`, every moved one in `moved`, `"recovery": "rederive"`. The compare-and-swap was not attempted, and nothing was written | read again, redo the work, and commit under a new basis |
+| the basis and the target held, and the target's own compare-and-swap was refused | `hold`, an empty `moved`, a `target` block, no `recovery` | by the block's `reason`; see [The target block](#the-target-block) |
+| the coordinator could not take its locks in time | `hold`, an empty `moved`, `"reason": "version_unconfirmed"`, `"recovery": "retry"`. Nothing ran | send the same request again later |
+| outcome unknown | `hold`, an empty `moved`, `"reason": "commit_unconfirmed"`, `"degraded": true`, `held_by`, no `recovery` | re-read the target, and retry only if your commit is absent |
+
+**`commit_unconfirmed`** means the commit may have landed: the coordinator's
+watchdog answered after the work may have won (`held_by: watchdog_timeout`), or
+the handler failed after a possible win (`held_by: handler_error`). Neither
+class fits, since retrying is wrong if it landed and re-deriving is wrong if it
+did not. Re-read the target and judge by its content, not its version: if it
+holds what you committed, you are done; if not, your commit is absent and you
+may retry. This answer never says `proceed` and never claims that nothing
+landed.
+
+**In process**, `commit_if_basis` takes `content` or `content_hash`: a missing
+hash is computed from the content, and neither, or two that disagree, raise
+`ValueError`. The target's `version` must equal `expected_target_version`. The
+committer is `agent_id`, with `caller` its session-level identity, as
+`commit_cas` takes them. It returns `BasisCommitResult(answer, artifact,
+signals)`: on a win, `artifact` is the target as the commit left it and
+`signals` the invalidation signals the commit produced, as `commit_cas`
+returns them. A refused compare-and-swap returns the hold with its `target`
+block, but the compare-and-swap's preconditions still raise, as they do from
+`commit_cas`: `OccCallerTransientError`, the `CoherenceError` for a caller that
+holds the target EXCLUSIVE or MODIFIED, and `GiverFenced`. A moved member is
+decided before any precondition runs. `deadline` works as for `check_basis`,
+and `RegistryLockTimeout` means nothing ran.
+
+**On `CoherentVolume`**, `commit_if_basis(basis, target, expected_target_version,
+content)` takes the target as a path and the content as bytes. A target that
+names a member is that member, and `expected_target_version` must be its
+version; any other target is compared by version only. A win writes `content`
+to disk and returns the `CasCommitResult` that `write_cas_at` returns: the
+committed version, and what the win did to a live handoff of the target. A
+hold returns the `BasisCommitAnswer` and leaves the disk untouched. It raises,
+writing nothing, where `write_cas_at` raises for the same refusal: `GiverFenced`
+for `handed_off`, `CoherenceError` for `occ_is_shared_or_invalid_only`, and
+`CoordinatorFailed` for an `other_holder` that is this volume's own unreleased
+write grant. An answer that may follow a landed commit (the outcome-unknown
+hold, the failure envelope, no answer after the request may have arrived, an
+HTTP `5xx`, an answer it cannot classify) raises `CommitUnconfirmed` in both
+`on_error` modes, with the disk untouched: re-read the target, and retry only
+if the commit is absent. A strict commit that never left raises
+`CoordinatorUnreachable`, a detached volume raises `CoherenceError`, and a
+coordinator without the route raises `BasisCheckAbsent`. Like `write_cas_at` it
+starts a new attempt first, which also releases the write grants this volume's
+`write()` left on other paths. It does not read the target first, since a read
+would register a record that a commit under a basis must not.
+
+### The target block
+
+When the basis and the target held but the target's own compare-and-swap was
+refused, the hold carries the refusal apart from the members:
+
+```json
+{"answer": "hold", "moved": [],
+ "target": {"path": "tasks/approvals.md", "reason": "other_holder", "current_version": 3}}
+```
+
+The block is `{path, reason, current_version}`, plus `captured_generation` and
+`owner_generation` when the refusal carries the
+[generation pair](#reading-a-commit-refusals-generation-pair), plus `successor`
+and `version_at_transfer` for a fenced giver. In Python it is `answer.target`,
+a `TargetRefusal`. Nothing was written and no member moved, so re-deriving the
+inputs would not change the outcome, and the block carries no recovery class.
+Its `reason` is one of these, the closed set `BASIS_TARGET_REFUSAL_REASONS` in
+`ccs.core.basis`:
+
+| `target.reason` | What it means for you | What to do | On `CoherentVolume` |
+|---|---|---|---|
+| `other_holder` | another agent holds the target's write grant (EXCLUSIVE or MODIFIED), and the compare-and-swap lost to it. The version has not moved | retry once the holder has released the file, not in a tight loop. If the holder commits first, the retry holds with the target in `moved` | returned as the hold; raises `CoordinatorFailed` when the holder is this volume's own unreleased write grant |
+| `stale_read_generation` | the claim your committing identity held on the target was reclaimed since its read | read the target again under a fresh identity (`reacquire()` on a volume, a new `agent_id` over HTTP), then commit | returned as the hold |
+| `caller_in_transient_state` | another agent's plain `write()` landed on the target between your read and your commit, and that agent may still hold the file | as for `other_holder` | returned as the hold |
+| `handed_off` | your session handed the target off and the handoff is still live, so the coordinator refuses its writes to it | not a conflict to retry; see [The giver's fence](#the-givers-fence) | raises `GiverFenced` |
+| `occ_is_shared_or_invalid_only` | your committing identity holds the target EXCLUSIVE or MODIFIED itself; a compare-and-swap is for a reader, and a holder commits with `pre-edit` and `post-edit` | commit as the holder, or release the grant and commit again | raises `CoherenceError` |
+
+### Over HTTP
+
+Both routes take the bearer token and the host checks every coordinator route
+takes, and answer HTTP `200` for every outcome above. A malformed request is
+`400`, never a hold.
+
+**`POST /basis/check`**
+
+| Field | Type | What it is |
+|---|---|---|
+| `session_id` | UUID string | your client identity; required |
+| `agent_id` | string, optional | a subagent id, 1 to 64 characters of `[A-Za-z0-9_-]`, as on the hook routes |
+| `basis` | list of 1 to 64 members | the inputs you recorded |
+
+**A member**
+
+| Field | Type | What it is |
+|---|---|---|
+| `path` | string | the workspace-relative path read, or a key when `name_kind` is `"key"` |
+| `version` | integer from 1 to 9223372036854775807 | the version the read confirmed, sent as a JSON number |
+| `registration` | UUID string or `null`, optional | the registration the read reported; absent or `null` compares the member by version only |
+| `name_kind` | `"file"` or `"key"`, optional | what `path` names; `"file"` when absent |
+
+**`POST /basis/commit`** takes the check's fields, plus:
+
+| Field | Type | What it is |
+|---|---|---|
+| `target` | a member | the file to commit. Its `version` is the version you expect it to be. A target that names a basis member must equal that member |
+| `content_hash` | 64 hex characters | the lowercase sha-256 hex digest of the exact bytes you commit; required, as on `/hooks/post-edit-cas` |
+
+The answers are the JSON bodies shown in
+[Checking a basis](#checking-a-basis) and
+[Committing under a basis](#committing-under-a-basis). A won commit records the
+target's new version and hash, and the coordinator does not touch the file:
+after the `proceed`, write the bytes you committed to it yourself. Treat
+anything that is not a `proceed` as not proceeding: a hold, a `4xx` or `5xx`,
+no answer, a body you cannot read, and a `404`. After a `/basis/commit` that
+got no readable answer, the commit may have landed, so re-read the target
+before you retry, as for `commit_unconfirmed`.
+
+The `400` answer is `{"error": "<text>"}`, naming what to fix:
+
+- `missing session_id`, or `session_id must be a UUID (8-4-4-4-12 hex with
+  hyphens)`;
+- `unknown field 'x'` for any top-level field outside the route's set,
+  `agentId` and `subagent_id` included: these routes do not read the hook
+  routes' other spellings of the subagent id;
+- `basis must be a non-empty list of members`, or `basis names at most 64
+  members, got N`;
+- for a member, prefixed `basis[i]` (or `target` for the target): `must be an
+  object of path, version, registration and name_kind`; `unknown field 'k'`;
+  the path check every path-taking route runs (`missing or empty path`, which
+  a `name_kind` other than `"file"` or `"key"` gets too, `path must be relative
+  (no leading /)`, `path contains '..' traversal`, `path contains control
+  characters`, `path exceeds 1024 chars`); `version must be an integer, got
+  X`; `version must be between 1 and 9223372036854775807, got N`; and
+  `registration must be a UUID, got X`;
+- `basis[i]: basis names one path, file or registration twice`: the same path,
+  two spellings the coordinator keys as one file, or the same registration;
+- `target names a basis member but disagrees with its path, version or
+  registration`;
+- on `/basis/commit`, `missing content_hash`, or `content_hash must be 64 hex
+  characters (sha-256)`;
+- `agent_id must be 1-64 chars of [A-Za-z0-9_-]`.
+
+**Caller principal.** `/basis/check` is accept-class and `/basis/commit` is
+require-class, like `/hooks/post-edit-cas` (see
+[What is checked, and where](#what-is-checked-and-where)). `/basis/commit` is
+refused with `503` while the coordinator drains for a migration, as the other
+commit routes are; `/basis/check` is still answered.
+
+**Deadlines.** The service and registry locks are taken with a deadline half a
+second before the handler's 4-second watchdog, so a check or commit that cannot
+take them in time answers the `version_unconfirmed` hold, in which nothing ran.
+The watchdog's own answer is the check's `version_unconfirmed` hold, or the
+commit's `commit_unconfirmed` hold, since a commit it abandoned may still land.
+
+`GET /status` counts calls to the routes as `basis_check_total` and
+`basis_commit_total` in `endpoint_counters`.
+
+### Asking a pre-read for the registration
+
+An HTTP client records a member from a `POST /hooks/pre-read` that sends the
+hash of the bytes it read and sets `"want_registration": true`:
+
+```json
+{"session_id": "<uuid>", "path": "tasks/plan.md",
+ "content_hash": "<sha-256 of the bytes you read>",
+ "want_registration": true}
+```
+
+```json
+{"status": "fresh", "version": 4, "registration": "<uuid>"}
+```
+
+Every admitted answer that reports a version carries the key, at the top level:
+a first read, a fresh read, and a stale-read warning, whose version is
+`summary.current_version`. Its value is the registration, or `null` when no
+record backs the version or the record holds no content (see
+[What the basis check does not do](#what-the-basis-check-does-not-do)). It is
+absent from a strict-mode deny, from the answer for an untracked or vanished
+path, and from a `degraded` answer. So a missing key on an admitted answer that
+reports a version means only that the coordinator does not serve the basis
+check. A pre-read without `want_registration` is answered exactly as before.
+
+Record `{path, version, registration}` only when the answer is admitted,
+reports a version, carries a `registration` that is not `null`, and does not
+flag `"hash_differs": true` (at the top level of a fresh answer, under
+`summary` on a stale one). Otherwise record nothing, as `read_for_basis` does.
+
+A pre-read that carries `want_registration` is not a Claude Code hook read, like
+one that carries `want_owner_generation`, `verify_only` or `name_kind`: after a
+strict-mode deny it keeps the deny, so read again under a new `agent_id` with
+the same `session_id` (see
+[After a strict-mode stale deny](#after-a-strict-mode-stale-deny)). The Node
+coordinator ignores the field: its answers never carry `registration`, and it
+reads a pre-read that sends the field alone as a hook read. Send
+`"want_owner_generation": true` beside it, as `read_for_basis` does.
+
+### What each surface answers
+
+| State | In process | HTTP | `CoherentVolume` |
+|---|---|---|---|
+| the path is not tracked | n/a: every record is in scope | hold `basis_member_unmanaged` | hold `basis_member_unmanaged` |
+| tracked, never read | hold `input_vanished` (unknown registration) | hold `input_vanished`, and no record is created | `read_for_basis` registers it on its first read; a member built by hand holds `input_vanished` |
+| deleted, then registered again | hold `basis_member_replaced` | hold `basis_member_replaced` | hold `basis_member_replaced` |
+| deleted, then written again by `CCSStore` under the same id at the same version | hold `basis_member_replaced`: the in-memory token changed | n/a | n/a |
+| a byte-identical re-save | hold `version_moved` | hold `version_moved` | hold `version_moved` |
+| a member built by hand with no registration | `ValueError`: required in process | compared by version only | compared by version only |
+| tracked and seen, but no content recorded yet | n/a | the pre-read reports `"registration": null`; a member built by hand is compared by version | `read_for_basis` raises until a commit records content |
+| version `0` in a member | `ValueError` | `400` | `ValueError` before sending |
+| another agent holds a member EXCLUSIVE or MODIFIED | not consulted | not consulted | not consulted |
+| the registry lock is not won in time | `RegistryLockTimeout`, when a `deadline` was passed | hold `version_unconfirmed` within the handler deadline | hold `version_unconfirmed` |
+| the commit's outcome is unknown | n/a | hold `commit_unconfirmed` | raises `CommitUnconfirmed`, disk untouched |
+| no answer, or a detached volume | n/a | n/a | raises, in both `on_error` modes |
+| the Node coordinator | n/a | `404` | raises `BasisCheckAbsent` |
+
+### How long the locks are held
+
+A check or a commit holds the registry lock, which every other request that
+reads or writes the registry waits for, for as long as it takes to read and
+compare its members. Measured as the shortest of five runs of the registry
+lock's hold, with `pytest -n 0` on an Intel MacBook Pro (Core i7-1068NG7,
+2.3 GHz):
+
+| Members | In memory: check | In memory: commit | SQLite: check | SQLite: commit |
+|---|---|---|---|---|
+| 1 | 0.01 ms | 0.05 ms | 0.03 ms | 0.27 ms |
+| 8 | 0.05 ms | 0.08 ms | 0.12 ms | 0.40 ms |
+| 64 | 0.31 ms | 0.39 ms | 0.76 ms | 1.32 ms |
+
+The Python coordinator always runs on SQLite. The 64-member cap bounds the
+hold; the figures do not include the wait for the locks.
+
+### What the basis check does not do
+
+- **One instant, not an atomic act.** A `proceed` says every member was current
+  at the instant of the check. An input can move right after it, and the act
+  that follows is not part of the check. When the act is a write of one file,
+  use `commit_if_basis`, which compares the basis and commits the target in one
+  step.
+- **Versions and registrations only.** No content hash is compared, so a
+  byte-identical re-save moves the version and holds. The ownership generation
+  is not compared either: a sweep that reclaims a grant moves the generation
+  without moving the version, so a basis still proceeds after it, where the
+  [effect fence](#effect-fence-over-http) holds.
+- **Act on the recorded bytes.** Grant state is not consulted, so a peer's
+  uncommitted edit can sit on disk under a `proceed`: another agent may hold a
+  member's write grant and have changed the file without committing. Build the
+  act from the bytes `read_for_basis` returned, not from a later read of the
+  disk.
+- **In process, act only on what `basis_member` returned**: its `content`, or
+  bytes whose hash is its `content_hash`. On the in-memory registry a commit
+  that passes only a hash leaves the previous body in place, so the stored body
+  can be older than the version.
+- **A store reset or a merge of spellings holds every basis recorded before
+  it.** Deleting `.coherence/state.db`, or a coordinator start that merges the
+  records an older build kept for one file under several spellings (see
+  [One file, many spellings](#one-file-many-spellings)), gives the records new
+  registrations or versions. A basis recorded earlier holds with
+  `basis_member_replaced`, `input_vanished` or `version_moved`: record it again.
+- **A rewind to a backup can proceed over a forgotten commit.** Putting back a
+  copy of `.coherence/` returns every record to the version and registration it
+  had when the copy was taken. A basis recorded at one of those versions
+  proceeds again, though a commit made after the copy may be on disk. Record
+  every basis again after restoring a backup.
+- **A record registered again under a caller-chosen id is not detected on
+  SQLite.** On the SQLite registry the registration is the record's id. A
+  caller that deletes a record, registers it again under the same artifact id
+  it chose, and brings it back to the recorded version is not detected. Nothing
+  this package ships does that: the coordinator gives every record it registers
+  a new id. The in-memory registry, which `CCSStore` runs on and which writes a
+  deleted key again under the same id, mints a new token at every registration
+  and does detect it.
+- **A file the coordinator holds no content for cannot be recorded.** A file
+  first registered without a hash (a pre-read with no hash, a Bash command that
+  reads it in a Claude Code session, an edit before the file's first commit, or
+  a `/session/begin` read set that names it) has no content claim, so the
+  pre-read reports `"registration": null` and `read_for_basis` raises. A commit
+  of the file through the coordinator records its content; reading again does
+  not.
+- **A member built by hand with no registration is compared by version only**,
+  over HTTP and on `CoherentVolume`, so a path deleted and registered again at
+  the same version passes it. In process every member needs its registration.
+- **A large basis can exceed the request limit.** The coordinator refuses a
+  request body over 64 KiB with `413` before reading it, and 64 members whose
+  paths are near the 1024-character limit pass that size: nothing is checked,
+  and `CoherentVolume` raises. Two checks of half a basis each are two
+  instants, not one.
+- **One host, cooperative writers, the Python coordinator only.** One
+  coordinator on one machine compares the basis, and a writer that does not
+  commit through it moves no version and is not seen. The Claude Code plugin's
+  Node coordinator serves neither route and reports no registration:
+  `read_for_basis`, `check_basis` and `commit_if_basis` raise
+  `BasisCheckAbsent` against it, never a `proceed`, and an HTTP client gets
+  `404`.
+- **No record of the answer.** The check keeps no decision log, does not name
+  the last writer, does not judge whether the work is right or done, and
+  schedules and retries nothing.
+
 ## Caller principal
 
 The coordinator authenticates the workspace, not the caller: one bearer secret
@@ -3774,8 +4409,8 @@ Every route that takes a `session_id` is in one of three classes:
 
 | Class | Routes | A request naming a session that has claimed a principal… |
 |---|---|---|
-| require | `/hooks/pre-edit`, `/hooks/session-stop`, `/hooks/post-edit`, `/hooks/post-edit-cas`, `/hooks/effect-fence`, `/workspace/checkpoint`, `/workspace/restore/register`, `/workspace/restore/status`, `/workspace/restore/member`, `/handoff/transfer`, `/handoff/accept`, `/handoff/decline`, `/handoff/withdraw` | …must present it. Without it, or with a different one, the answer is `400`. |
-| accept | `/hooks/pre-read`, `/hooks/pre-bash`, `/hooks/pre-grep`, `/hooks/session-start`, and the five `/session/*` routes | …is admitted without it, but refused with a different one. |
+| require | `/hooks/pre-edit`, `/hooks/session-stop`, `/hooks/post-edit`, `/hooks/post-edit-cas`, `/hooks/effect-fence`, `/workspace/checkpoint`, `/workspace/restore/register`, `/workspace/restore/status`, `/workspace/restore/member`, `/handoff/transfer`, `/handoff/accept`, `/handoff/decline`, `/handoff/withdraw`, `/basis/commit` | …must present it. Without it, or with a different one, the answer is `400`. |
+| accept | `/hooks/pre-read`, `/hooks/pre-bash`, `/hooks/pre-grep`, `/hooks/session-start`, the five `/session/*` routes, and `/basis/check` | …is admitted without it, but refused with a different one. |
 | mint | `/principal/claim` | …is where principals come from; its gate is the mint nonce. |
 
 The require class is the routes that take, release or commit a session's
@@ -3797,7 +4432,10 @@ bound session commits as that session on `/session/commit` and
 `/session/commit_all`. Against a live handoff of the path it is therefore
 refused as that session when that session is the giver, completes the handoff
 when it is the successor, and is recorded as the counterparty of an overtake
-otherwise.
+otherwise. `/basis/check` is accept-class for another reason: its answer does
+not depend on who asks, and it registers, grants, drains and records nothing
+for the named session, so a request naming a bound session learns only what
+any request about the same paths learns.
 
 A refusal is HTTP `400` with an `error` field naming the header and a `reason`
 field: `caller_principal_absent` when a claimed session is named with no
@@ -3948,6 +4586,7 @@ committed or invalidated:
 | `POST /session/commit` | `{"ok": false, "reason": "handed_off", "successor": "<agent id>", "version_at_transfer": 7}` |
 | `POST /session/commit_all` | the same, plus `path` naming the handed-off member; no member of the batch commits |
 | `POST /workspace/restore/register` | the same, plus `path` |
+| `POST /basis/commit` | a hold with an empty `moved` and `"target": {"path": …, "reason": "handed_off", "current_version": 7, "successor": "<agent id>", "version_at_transfer": 7}`; `CoherentVolume.commit_if_basis` raises `GiverFenced` (see [The target block](#the-target-block)) |
 
 The fence covers writes only: a read from the giver is answered by the ordinary
 rules and carries the [`handoff` key](#the-handoff-key) with its outcome,
@@ -4166,8 +4805,8 @@ unknown, so read the record again before acting on it.
 
 While a path has a transfer record — live, or ended and not yet evicted — the
 answers of `POST /hooks/pre-read`, `/hooks/pre-edit`, `/hooks/post-edit` and
-`/hooks/post-edit-cas` for that path carry a top-level `handoff` key, projected
-for the caller:
+`/hooks/post-edit-cas` for that path, and a won `/basis/commit` of it, carry a
+top-level `handoff` key, projected for the caller:
 
 ```json
 "handoff": {"role": "successor", "giver": "<agent id>", "successor": "<agent id>",
@@ -5150,10 +5789,10 @@ had committed, as the writer of bytes no session committed.
 
 **Which callers keep the deny.** Only Claude Code hook reads recover this way.
 The coordinator tells them apart by the request: a `pre-read` that carries any
-of `want_owner_generation`, `verify_only` and `name_kind`, whatever its value,
-is not a hook read. It keeps a strict deny in place across retries, as before,
-and neither starts nor uses up a session's recovery. Those callers recover
-their own way:
+of `want_owner_generation`, `verify_only` and `name_kind`, or on the Python
+coordinator `want_registration`, whatever its value, is not a hook read. It
+keeps a strict deny in place across retries, as before, and neither starts nor
+uses up a session's recovery. Those callers recover their own way:
 
 - `CoherentVolume`, and the
   [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server) built on
@@ -5168,6 +5807,10 @@ their own way:
   decide again.
 - the [raw HTTP capture](#capturing-the-comparands), which sends
   `want_owner_generation`: capture again under a new `agent_id`.
+- a raw HTTP client [recording a basis](#asking-a-pre-read-for-the-registration)
+  on the Python coordinator, which sends `want_registration`: read again under
+  a new `agent_id`. `CoherentVolume.read_for_basis` sends
+  `want_owner_generation` too, and recovers with `reacquire()`.
 
 **Limits.**
 
@@ -5340,7 +5983,7 @@ keeps none of them. A refuse-mode `CoherentVolume` types each answer for you; se
 | Node coordinator: the store is busy before the grant, or (rarely) fails after it | `{"ok": false, "reason": "internal: SqliteError"}`; nothing is granted unless the failure came after the grant | none | back off, then release |
 | the path is not tracked | `{"ok": true}`, unchecked; it may carry re-grounding context | none, or `watchdog_timeouts_total` when delivering that context times out, which still answers `{"ok": true}` | proceed; the path is outside this contract (see **What it does not close**) |
 | Python coordinator: the caller is the giver of a live handoff of the path | the `handed_off` deny | `handoff_giver_denials_total` | stop: no retry clears it |
-| the path is in strict mode and the caller's read is stale | the strict deny: `"status": "stale"`, a deny in `hookSpecificOutput`, and no top-level `reason` | `strict_mode_denials_total` and `stale_warning_emitted_total` | re-read, then send again: a Claude Code session's next Read of the file is admitted once it reads the recorded bytes (see [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)); a client whose `pre-read` sends `want_owner_generation`, `verify_only` or `name_kind` keeps the deny, which never re-grants its identity, so it re-reads under a new `agent_id` with the same `session_id` |
+| the path is in strict mode and the caller's read is stale | the strict deny: `"status": "stale"`, a deny in `hookSpecificOutput`, and no top-level `reason` | `strict_mode_denials_total` and `stale_warning_emitted_total` | re-read, then send again: a Claude Code session's next Read of the file is admitted once it reads the recorded bytes (see [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)); a client whose `pre-read` sends `want_owner_generation`, `verify_only`, `name_kind` or `want_registration` keeps the deny, which never re-grants its identity, so it re-reads under a new `agent_id` with the same `session_id` |
 | another agent holds the path EXCLUSIVE or MODIFIED; on the Node coordinator, one whose grant is less than 1800 s old or has no recorded grant time | `other_holder` | `pre_edit_other_holder_denials_total` | back off; once admitted, re-read the file before writing |
 | Node coordinator: another agent has held the path EXCLUSIVE or MODIFIED for 1800 s or more | the plain admit, with no collision warning: the coordinator reclaims that grant in the same decision (see **On the Node coordinator**) | none | proceed |
 | no other agent holds the path EXCLUSIVE or MODIFIED | the admit an ordinary `pre-edit` gets, but never with a collision warning: the decision displaced nobody, even when a holder let go just before it | as for an ordinary `pre-edit` | proceed |
@@ -5396,8 +6039,8 @@ one. Poll with backoff rather than wait for a signal.
   since, the caller's next `pre-edit` is not denied as stale. A caller another
   agent's acquire or commit left INVALID stays INVALID, so on a strict-mode
   path its next `pre-edit` gets the strict deny. After that deny, a `pre-read`
-  of the path that carries none of `want_owner_generation`, `verify_only` and
-  `name_kind`, as a Claude Code hook read does, is admitted once it reads the
+  of the path that carries none of `want_owner_generation`, `verify_only`,
+  `name_kind` and `want_registration`, as a Claude Code hook read does, is admitted once it reads the
   recorded bytes (see
   [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)). A
   `pre-read` that carries one of them never re-grants that identity, and every
@@ -5719,7 +6362,9 @@ with its own policy, and each bounds its wait in its own way:
   before. This package's coordinator does not track it either and admits the
   Node client's opted-in edit as untracked, so there the two clients differ
   only when the coordinator does not answer: the Node client gives the
-  unavailable deny where this package's client prints `{}`.
+  unavailable deny where this package's client prints the could-not-verify
+  advisory, or `{}` when nothing listens on the port (see
+  [When a Claude Code edit gets no answer](#when-a-claude-code-edit-gets-no-answer)).
 - **Names under `subject:`.** The Node hook client never counts a file whose
   name starts with the reserved `subject:` prefix as strict, so it never opts
   in for one. This package's coordinator treats a file such as
@@ -5731,6 +6376,11 @@ with its own policy, and each bounds its wait in its own way:
   [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)), so with the
   setting on, this package's client gets the unavailable deny there for every
   edit of a strict file whose name starts with `subject:`.
+- **An edit the coordinator did not decide.** With the setting off, or for a
+  file neither client counts as strict, this package's client prints the
+  could-not-verify advisory for a `pre-edit` that a running coordinator
+  answered with a `5xx` or its failure envelope, or did not answer, and the
+  Node hook client does not (see [When a Claude Code edit gets no answer](#when-a-claude-code-edit-gets-no-answer)).
 - **Timing.** The Node hook client bounds the whole decision by one 5-second
   deadline, and this package's client gives each request its own 6-second
   timeout (see **When the coordinator does not answer** below).
@@ -6453,7 +7103,7 @@ Use these to gate alerts or health checks without keeping a separate event list.
 
 ## Examples
 
-All examples are runnable with `python -m examples.<name>.main` (or `.demo` where noted) from the project root.
+All examples run from the project root with the command in their row: most with `python -m examples.<name>.main`, some with `.demo`, and the two basis demos with their own module names (`examples.basis_gate.stale_check` and `examples.basis_gate.stale_approval`).
 
 Correctness demos lead; the token-savings / hit-rate demos follow.
 
@@ -6465,6 +7115,8 @@ Correctness demos lead; the token-savings / hit-rate demos follow.
 | Coherent volume | `python -m examples.coherent_volume.main` | Sequential stale-write deny + recovery on plain files (offline, no keys) |
 | Concurrent writers | `python -m examples.concurrent_writers.main` | True-race lost update; `write_cas` preserves both updates (offline, no keys) |
 | Effect gate | `python -m examples.effect_gate.main` | `gate()` holds an effect on a stale input; `--baseline` shows the stale fire (offline, no keys) |
+| Stale check | `python -m examples.basis_gate.stale_check` | A check reads a spec and a fixture, a peer edits both, then the act stamps the fixture: the unguarded act stamps the old fixture, `gate()` fires anyway, one fence call per input names only the first moved input, `check_basis` names both, and `commit_if_basis` holds with the fixture untouched; `--runs N` repeats it (offline, no keys) |
+| Stale approval | `python -m examples.basis_gate.stale_approval` | An approval of a plan and its budget is written to an approvals file that is not one of its inputs, after a peer edited both: the same arms, plus a second approver whose basis still proceeds after the first approval lands; `--runs N` repeats it (offline, no keys) |
 | MCP stale-write guard | `python -m examples.mcp_stale_write_guard.main` | Red→green stale-write deny through the MCP server tools (offline, no keys) |
 | Workspace versioning & restore | `python -m examples.workspace_versioning.main` | Checkpoint a mixed file + S3 workspace, then restore it with per-member honesty (`restored` / `conflict` / delete leg / forward-only skip); `--baseline` shows the unrecoverable loss first (offline, no keys) |
 | Session handoff | `python -m examples.session_handoff.main` | Two sessions, each a real OS process, share a scratch file and hand off through a checkpoint: plain file I/O loses the second session's line with nothing raised; `CoherentVolume` denies the stale write and both lines survive; a rewind lands cleanly when the handing-off session stopped and concludes `conflict` when it is still writing (offline, no keys) |

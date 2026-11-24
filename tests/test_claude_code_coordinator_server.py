@@ -11267,9 +11267,11 @@ def _principal_refused(response: tuple[int, dict]) -> bool:
 
 #: FROZEN duplicate of the posture table (route -> class). Never derived from
 #: ``_CALLER_PRINCIPAL_POSTURE``: a derived expectation moves with the edit that
-#: breaks it. Twenty-three routes: the eighteen the plan enumerates, the mint,
-#: and the four grant-handoff verbs (#185), which are require-class: each acts
-#: as the named session on a claim or a handoff record.
+#: breaks it. Twenty-five routes: the eighteen the plan enumerates, the mint,
+#: the four grant-handoff verbs (#185), which are require-class: each acts
+#: as the named session on a claim or a handoff record, and the two basis
+#: routes: the check is accept-class (its answer does not depend on who asks
+#: and it records nothing), the commit require-class like post-edit-cas.
 #: ``pre-edit`` is require-class: a bound session's caller without its
 #: principal could take an EXCLUSIVE grant it can neither commit nor release.
 _EXPECTED_ROUTE_POSTURE: dict[tuple[str, str], str] = {
@@ -11296,8 +11298,10 @@ _EXPECTED_ROUTE_POSTURE: dict[tuple[str, str], str] = {
     ("POST", "/handoff/accept"): "require",
     ("POST", "/handoff/decline"): "require",
     ("POST", "/handoff/withdraw"): "require",
+    ("POST", "/basis/check"): "accept",
+    ("POST", "/basis/commit"): "require",
 }
-_EXPECTED_POSTURE_ROUTE_COUNT = 23
+_EXPECTED_POSTURE_ROUTE_COUNT = 25
 
 _NEVER_MINTED_TOKEN = "A" * 43  # in session-token shape, never issued
 
@@ -11359,6 +11363,11 @@ def _posture_body(route: tuple[str, str], sid: str) -> dict:
         "/handoff/accept": {"path": "posture.md"},
         "/handoff/decline": {"path": "posture.md"},
         "/handoff/withdraw": {"path": "posture.md"},
+        "/basis/check": {"basis": [{"path": "posture.md", "version": 1}]},
+        "/basis/commit": {
+            "basis": [{"path": "posture.md", "version": 1}],
+            "target": {"path": "posture.md", "version": 1}, "content_hash": h,
+        },
     }
     return {"session_id": sid, **bodies[path]}
 
@@ -11704,12 +11713,15 @@ _GATED_ROUTES = sorted(
 
 def _degrade_body(route: tuple[str, str], sid: str) -> dict:
     """:func:`_posture_body`, with a TRACKED path wherever the posture body's
-    untracked one would let the handler answer before its work body runs."""
+    untracked one would let the handler answer before its work body runs (a
+    basis route's members and target included)."""
     body = _posture_body(route, sid)
     if body.get("path") == "posture.md":
         body["path"] = "plan.md"
     if body.get("command") == "cat posture.md":
         body["command"] = "cat plan.md"
+    for member in [*body.get("basis", []), *([body["target"]] if "target" in body else [])]:
+        member["path"] = "plan.md"
     return body
 
 
@@ -12944,6 +12956,22 @@ _FENCE_INTERNAL_HOLD_ENVELOPE = {
     "held_by": "handler_error",
 }
 _FENCE_ROUTE = ("POST", "/hooks/effect-fence")
+#: FROZEN duplicates of the basis routes' answers for a raise: a hold each, the
+#: check's saying nothing ran and the commit's that its outcome is unknown,
+#: since the raise may follow a win.
+_BASIS_CHECK_INTERNAL_HOLD_ENVELOPE = {
+    "answer": "hold", "moved": [], "reason": "version_unconfirmed", "recovery": "retry",
+    "degraded": True, "held_by": "handler_error",
+}
+_BASIS_COMMIT_INTERNAL_HOLD_ENVELOPE = {
+    "answer": "hold", "moved": [], "reason": "commit_unconfirmed", "degraded": True,
+    "held_by": "handler_error",
+}
+#: The service call each basis route's work body makes.
+_BASIS_SERVICE_CALL = {
+    ("POST", "/basis/check"): "check_basis",
+    ("POST", "/basis/commit"): "commit_if_basis",
+}
 
 
 def _fail_binding_reads(coordinator, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -12962,8 +12990,10 @@ def _fail_work_body(
 ) -> None:
     """Make ``route``'s WORK BODY raise the same registry error the gate's
     lookup raises in the tests below. The effect fence catches inside its own
-    body (it owns that arm), so its verdict is what raises; every other route
-    lets the exception reach the wrapper, so the watchdog call is what raises."""
+    body (it owns that arm), so its verdict is what raises; a basis route's
+    service call raises inside its work body, which lets it reach the
+    wrapper; every other route lets the exception reach the wrapper, so the
+    watchdog call is what raises."""
     import sqlite3
 
     import ccs.adapters.claude_code.coordinator_server as mod
@@ -12973,6 +13003,8 @@ def _fail_work_body(
 
     if route == _FENCE_ROUTE:
         monkeypatch.setattr(mod, "_effect_fence_verdict", raising)
+    elif route in _BASIS_SERVICE_CALL:
+        monkeypatch.setattr(coordinator.service, _BASIS_SERVICE_CALL[route], raising)
     else:
         monkeypatch.setattr(coordinator, "run_with_watchdog", raising)
 
@@ -13026,8 +13058,10 @@ def test_a_gate_whose_store_read_raises_answers_exactly_its_routes_failed_work_b
         (("POST", "/hooks/pre-edit"), None, _INTERNAL_ERROR_ENVELOPE),
         (("POST", "/hooks/pre-read"), _NEVER_MINTED_PRINCIPAL, _INTERNAL_ERROR_ENVELOPE),
         (_FENCE_ROUTE, None, _FENCE_INTERNAL_HOLD_ENVELOPE),
+        (("POST", "/basis/check"), _NEVER_MINTED_PRINCIPAL, _BASIS_CHECK_INTERNAL_HOLD_ENVELOPE),
+        (("POST", "/basis/commit"), None, _BASIS_COMMIT_INTERNAL_HOLD_ENVELOPE),
     ],
-    ids=["pre-edit", "pre-read-with-a-principal", "effect-fence"],
+    ids=["pre-edit", "pre-read-with-a-principal", "effect-fence", "basis-check", "basis-commit"],
 )
 def test_a_gate_whose_store_read_raises_answers_the_typed_envelope_and_changes_nothing(
     route: tuple[str, str], presented: str | None, envelope: dict,
@@ -13847,6 +13881,7 @@ _ATTEMPT_COUNTER = {
     "/handoff/accept": "handoff_accept_total",
     "/handoff/decline": "handoff_decline_total",
     "/handoff/withdraw": "handoff_withdraw_total",
+    "/basis/commit": "basis_commit_total",
 }
 _REFUSED_SUBAGENT = "sub-refused"
 
@@ -13947,6 +13982,12 @@ def _refused_request_body(route: tuple[str, str], seed: dict, *, subagent: bool)
         "/handoff/accept": {"path": "plan.md"},
         "/handoff/decline": {"path": "plan.md"},
         "/handoff/withdraw": {"path": "plan.md"},
+        # A target the peer holds no grant on, at its version: admitted, the
+        # commit wins and moves the version.
+        "/basis/commit": {
+            "basis": [{"path": "spec.md", "version": 1}],
+            "target": {"path": "spec.md", "version": 1}, "content_hash": h,
+        },
     }
     body = {"session_id": seed["peer"], **bodies[path]}
     if subagent:
@@ -20740,8 +20781,10 @@ _NOT_A_HOOK_READ: dict[str, dict] = {
     "want_owner_generation": {"want_owner_generation": True},
     "verify_only": {"verify_only": True},
     "name_kind": {"name_kind": "file"},
+    "want_registration": {"want_registration": True},
     "want_owner_generation-false": {"want_owner_generation": False},
     "verify_only-false": {"verify_only": False},
+    "want_registration-false": {"want_registration": False},
 }
 
 
@@ -20750,13 +20793,14 @@ def test_a_pre_read_that_is_not_a_hook_read_keeps_its_deny_and_leaves_the_recove
     plan_desk: _PlanDesk, field: str,
 ) -> None:
     """#514: a pre-read carrying any of these fields is a CoherentVolume read,
-    an effect-fence check, a raw capture or the substrate, whose recovery is a
-    new identity. Every such read of the stale file is denied: its denies arm
-    nothing, so the hook Read after them is still denied; and once a hook
-    Read's deny has armed the recovery, such a read neither takes it nor uses
-    it up, so the hook Read after it is admitted. Fails if any one of the
-    three fields is dropped from the rule, and, through the false-valued
-    cases, if the rule reads a field's value rather than its presence."""
+    an effect-fence check, a raw capture, a basis recording or the substrate,
+    whose recovery is a new identity. Every such read of the stale file is
+    denied: its denies arm nothing, so the hook Read after them is still
+    denied; and once a hook Read's deny has armed the recovery, such a read
+    neither takes it nor uses it up, so the hook Read after it is admitted.
+    Fails if any one of the four fields is dropped from the rule, and, through
+    the false-valued cases, if the rule reads a field's value rather than its
+    presence."""
     marker = _NOT_A_HOOK_READ[field]
     reader, _writer = _stale_reader(plan_desk)
 

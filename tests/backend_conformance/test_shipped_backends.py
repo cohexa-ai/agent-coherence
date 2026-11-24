@@ -145,6 +145,18 @@ def test_forget_agent_forgets_only_an_ended_identity(factory: RegistryFactory) -
     kit.assert_forget_agent_forgets_only_an_ended_identity(factory)
 
 
+def test_basis_rows_find_rows_by_registration_and_name(factory: RegistryFactory) -> None:
+    kit.assert_basis_rows_find_rows_by_registration_and_name(factory)
+
+
+def test_moved_basis_reports_every_move_and_writes_nothing(factory: RegistryFactory) -> None:
+    kit.assert_moved_basis_reports_every_move_and_writes_nothing(factory)
+
+
+def test_peer_cannot_land_between_basis_compare_and_commit(factory: RegistryFactory) -> None:
+    kit.assert_peer_cannot_land_between_basis_compare_and_commit(factory)
+
+
 # ---------------------------------------------------------------------------
 # R18 — declared liveness source matches the Unit-4 contract + observed behavior.
 # ---------------------------------------------------------------------------

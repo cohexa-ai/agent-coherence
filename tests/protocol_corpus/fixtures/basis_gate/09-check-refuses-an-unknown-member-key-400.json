@@ -1,0 +1,35 @@
+{
+  "name": "basis-check-refuses-an-unknown-member-key-400",
+  "description": "CLIENT ERROR. A member carrying a key outside path, version, registration and name_kind is refused with 400 and names the member by position.",
+  "setup": {
+    "tracked": [
+      "docs/**"
+    ],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n"
+    }
+  },
+  "request": {
+    "method": "POST",
+    "path": "/basis/check",
+    "body": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "basis": [
+        {
+          "path": "docs/plan.md",
+          "version": 1,
+          "colour": "red"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": "basis[0]: unknown field 'colour'"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

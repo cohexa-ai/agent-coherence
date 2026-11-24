@@ -12,7 +12,7 @@ shipped. Nothing here connects to, reads from, or writes to any store.
 
 It follows the :mod:`ccs.coordinator.registry_protocol` precedent (a module that
 owns Protocols + shared types the two registries re-export). Where that module
-names the registry SURFACE (the 68-member ``RegistryBase`` + ``SqliteExtended``
+names the registry SURFACE (the 70-member ``RegistryBase`` + ``SqliteExtended``
 Protocols; the 9 detection members sit on their own ``ForeignWriteDetection``),
 this module names the CONTRACT that surface must satisfy for a
 backend to host the atomic boundary: which members participate in the
@@ -110,7 +110,7 @@ class MemberContract:
     rationale: str
 
 
-# The 77 members of RegistryBase (53 methods + 1 property), SqliteExtended
+# The 79 members of RegistryBase (55 methods + 1 property), SqliteExtended
 # (+14 methods) and ForeignWriteDetection (+9 methods), classified against the CoordinatorService call sites. The
 # ATOMIC_CLASS members are the ones the service touches INSIDE its atomic
 # mutation paths (``write`` / ``commit`` / ``commit_cas`` under ``abort_guard``;
@@ -143,6 +143,24 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "the kit fails one that reads the pair in a second step after deciding, "
         "by checking every refusal against the states a concurrent reclaim, "
         "peer commit and re-capture pass through.",
+    ),
+    MemberContract(
+        "commit_cas_if_basis",
+        MemberClass.ATOMIC_CLASS,
+        "base",
+        "commit_cas gated on a caller-recorded basis, in the same serialized "
+        "step: every basis id's version, and the target's expected version "
+        "whether or not the target is listed, is compared FIRST, inside the "
+        "target's own BEGIN IMMEDIATE (in-memory: the same _lock hold), and "
+        "only an unchanged basis reaches the version-CAS, grant and fence "
+        "legs, which are commit_cas's own. Any moved or vanished id returns "
+        "BasisMoved naming every one and writes nothing: no version bump, no "
+        "state change, no conflict count, no conflict callback. Comparing "
+        "outside that step is the gap it closes: a writer on a second store "
+        "handle could commit between a separate compare and the commit. The "
+        "conformance kit starts such a writer from the compare step and fails "
+        "a backend that lets it land first. Refuses more ids than one "
+        "statement may bind (BASIS_MAX_BOUND_IDS).",
     ),
     MemberContract(
         "commit_all",
@@ -580,6 +598,19 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "Non-mutating.",
     ),
     MemberContract(
+        "basis_rows",
+        MemberClass.READ_ONLY,
+        "base",
+        "Resolves a basis by lookup only: the id, exact name, current version "
+        "and registration of every row whose registration or exact name is "
+        "asked, in ONE statement (sqlite, no BEGIN) or one _lock hold "
+        "(in-memory), so every member is read at one instant. Mints no row, "
+        "grants nothing, captures no read_generation, counts nothing. The "
+        "registration is a UUID that changes whenever a path is registered "
+        "again: the row id on sqlite, a token minted per registration "
+        "in-memory. Refuses more ids than one statement may bind.",
+    ),
+    MemberContract(
         "valid_holders",
         MemberClass.READ_ONLY,
         "base",
@@ -858,7 +889,7 @@ MEMBER_CLASSIFICATION: dict[str, MemberContract] = {
     contract.name: contract for contract in _MEMBER_CONTRACTS
 }
 """Every ``RegistryBase`` + ``SqliteExtended`` member → its :class:`MemberContract`
-(R8). Keyed by member name. The key set must equal the 77-member Protocol surface
+(R8). Keyed by member name. The key set must equal the 79-member Protocol surface
 exactly — :mod:`tests.test_backend_contract` fails if ``registry_protocol.py``
 gains or loses a member without a matching update here (bidirectional drift
 guard). Includes the ``coordinator_epoch`` property (property-omission teeth)."""

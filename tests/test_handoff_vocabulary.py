@@ -22,6 +22,8 @@ import pytest
 
 from ccs.adapters.coherent_object import ConditionalPutRetriesExhausted
 from ccs.core.exceptions import (
+    BASIS_MEMBER_REPLACED,
+    BASIS_MEMBER_UNMANAGED,
     CALLER_PRINCIPAL_REASONS,
     CAS_EXHAUSTED_REASON,
     COHERENCE_DIR_REFUSAL_KINDS,
@@ -55,6 +57,7 @@ from ccs.core.exceptions import (
     HOLD_REASONS,
     INTERNAL_CONCURRENCY_REASON,
     OCC_CALLER_TRANSIENT_REASON,
+    OCC_IS_SHARED_OR_INVALID_ONLY_REASON,
     OTHER_HOLDER_REASON,
     POLICY_FILE_REFUSAL_KINDS,
     POLICY_FILE_REFUSED_REASON,
@@ -181,6 +184,9 @@ def test_handoff_reasons_collide_with_no_existing_reason_or_status() -> None:
             UNAVAILABLE_REASON,
             COHERENCE_DIR_REFUSED_REASON,
             POLICY_FILE_REFUSED_REASON,
+            BASIS_MEMBER_UNMANAGED,
+            BASIS_MEMBER_REPLACED,
+            OCC_IS_SHARED_OR_INVALID_ONLY_REASON,
         }
     )
     assert HANDOFF_REASONS.isdisjoint(existing)

@@ -8,7 +8,7 @@ frozen dataclasses, string constants) formalizing what a networked registry
 backend must provide to re-home the coordinator's atomic boundary. These tests
 are the DRIFT GUARDS the plan calls for:
 
-- the member-classification map covers EXACTLY the 77 ``RegistryBase`` +
+- the member-classification map covers EXACTLY the 79 ``RegistryBase`` +
   ``SqliteExtended`` members — no more, no fewer — so a Protocol member added or
   removed in ``registry_protocol.py`` without a matching contract update FAILS
   CI (bidirectional guard);
@@ -19,7 +19,7 @@ are the DRIFT GUARDS the plan calls for:
 - a classification value outside the enum is unrepresentable (typed);
 - the tier enum has exactly ``TIER_1`` and ``TIER_2``.
 
-The expected 77-member set is FROZEN here (imported from the parity test's own
+The expected 79-member set is FROZEN here (imported from the parity test's own
 frozen name-sets), NOT derived from the Protocol at runtime — so a silent
 Protocol edit cannot move the goalposts this test guards (the same discipline
 ``tests/test_registry_protocol_parity.py`` uses).
@@ -44,8 +44,8 @@ from ccs.coordinator.backend_contract import (
     Tier,
 )
 
-# The 77-member expected surface, imported from the parity test's FROZEN
-# name-sets (53 base + 14 extended + 9 detection methods + 1 base property). Reusing
+# The 79-member expected surface, imported from the parity test's FROZEN
+# name-sets (55 base + 14 extended + 9 detection methods + 1 base property). Reusing
 # those frozensets means this contract and the Protocol parity share ONE
 # source of truth for the surface: if either the parity test or the Protocol
 # changes the surface, the two drift guards fire together.
@@ -62,19 +62,19 @@ EXPECTED_MEMBERS = (
 
 
 # ---------------------------------------------------------------------------
-# Member classification — exactly the 77 Protocol members, no drift
+# Member classification — exactly the 79 Protocol members, no drift
 # ---------------------------------------------------------------------------
 
 
 def test_member_map_covers_exactly_the_protocol_surface() -> None:
-    """The classification map keys equal the 77-member Protocol surface EXACTLY
+    """The classification map keys equal the 79-member Protocol surface EXACTLY
     — no more, no fewer. A member added to (or removed from) ``registry_protocol.py``
     without a matching contract update fails HERE (bidirectional drift guard)."""
     assert set(MEMBER_CLASSIFICATION) == EXPECTED_MEMBERS
 
 
-def test_member_map_has_exactly_77_members() -> None:
-    """Pin the count explicitly: 53 base methods (SB-18 ``commit_all``, the
+def test_member_map_has_exactly_79_members() -> None:
+    """Pin the count explicitly: 55 base methods (SB-18 ``commit_all``, the
     WV Unit-2 checkpoint surface — 8 members — then the effect-gate pair read
     ``get_artifact_and_generation``, then the SB-10 comparand read
     ``last_observed_version_for``, then the caller-principal pair
@@ -82,12 +82,13 @@ def test_member_map_has_exactly_77_members() -> None:
     handoff's transfer-record four ``transfer_grants`` /
     ``get_transfer_record`` / ``set_transfer_status`` /
     ``evict_transfer_records``, then #191's ``claim_checkpoint_registration``,
-    then #525's ``forget_agent`` added) + 14 extended methods + 9 foreign-write
-    detection methods on their own Protocol + 1 base property = 77. Guards
+    then #525's ``forget_agent``, then the basis pair ``basis_rows`` /
+    ``commit_cas_if_basis`` added) + 14 extended methods + 9 foreign-write
+    detection methods on their own Protocol + 1 base property = 79. Guards
     against a same-size add+remove that would slip past the set-equality check
     on cardinality alone."""
-    assert len(MEMBER_CLASSIFICATION) == 77
-    assert len(EXPECTED_MEMBERS) == 77
+    assert len(MEMBER_CLASSIFICATION) == 79
+    assert len(EXPECTED_MEMBERS) == 79
 
 
 def test_coordinator_epoch_property_is_in_the_map() -> None:
@@ -133,6 +134,7 @@ def test_the_atomic_class_boundary_members_are_classified_atomic() -> None:
     READ_ONLY/INDEPENDENT fails."""
     expected_atomic = {
         "commit_cas",
+        "commit_cas_if_basis",
         "commit_all",
         "set_artifact_and_content",
         "set_agent_state",
